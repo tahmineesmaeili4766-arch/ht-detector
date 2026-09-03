@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>humanly_testing — прод-детектор rc93</title>
+
+<!--
+  rc93 §2. ПУБЛИЧНАЯ версия стенда: та же логика, что у
+  tests/fixtures/detector_api_v1.html (таблицы A и B) плюс компактная запись
+  подписи событий, но по HTTPS-адресу — потому что боевой браузер живёт
+  в Octo, ходит через прокси и до нашего диска не достаёт.
+
+  ⚠️⚠️ РЕЖИМЫ РАЗДЕЛЕНЫ ПАРАМЕТРОМ URL, и это НЕ удобство (правило rc89).
+  Проверки B читают, остались ли нативные функции нативными
+  (`Function.prototype.toString`). Хуки A патчат ровно те же прототипы, то есть
+  в одном документе часть A ГАРАНТИРОВАННО испортила бы часть B.
+      ?mode=api     — ставит хуки (таблица A);
+      ?mode=engine  — не ставит ничего (таблица B, по умолчанию).
+  Режим отдаётся в дампе полем `mode`: ноль при выключенных хуках обязан быть
+  отличим от нуля при включённых.
+
+  ⚠️ Страница на ЧУЖОМ домене, с другим TLS и заголовками. На `isTrusted`,
+  тайминги и след API это не влияет; на всё, что связано с origin (сеть,
+  куки, CSP), — влияет. Не читать одно за другое.
+
+  ⚠️ Никаких внешних запросов и никакой серверной части: страница ничего
+  никуда не отправляет. Результат забирает САМ владелец через DOM-мост.
+-->
+
+<script>
+//: ⚠️⚠️ ЭТОТ СКРИПТ ОБЯЗАН БЫТЬ ПЕРВЫМ в документе: он изображает сайт,
+//: который снимает отпечаток раньше всего остального.
+//: ⚠️ Чего он НЕ видит и видеть не может: `add_init_script` Playwright
+//: исполняется ДО первого скрипта документа, поэтому наблюдатель библиотеки
+//: подписывается РАНЬШЕ этих хуков. Это измеряемое свойство, а не дефект;
+//: в дампе оно отражено полем `mo_note`.
+(function () {
+  'use strict';
+
+  var MODE = (location.search.indexOf('mode=api') >= 0) ? 'api' : 'engine';
+  var HOOKS = (MODE === 'api');
+  var CAP = 6000;                       // кап на журнал событий
+  var BUILD = 'rc93';
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  Часть A: НАШ след — какие API страница видит от кода библиотеки
+  // ══════════════════════════════════════════════════════════════════════
+
+  var H = {};
+  function slot(name) {
+    if (!H[name]) { H[name] = {n: 0, detail: [], ts: []}; }
+    return H[name];
+  }
+  function bump(name, detail) {
+    var s = slot(name);
+    s.n += 1;
+    if (s.ts.length < CAP) { s.ts.push(Math.round(performance.now() * 10) / 10); }
+    if (detail !== undefined && s.detail.length < 200) { s.detail.push(detail); }
+  }
+
+  //: ⚠️ Оригиналы сохраняются ДО подмены и используются самой страницей:
+  //: иначе фикстура считала бы собственные вызовы и контроль перестал бы
+  //: быть нулевым.
+  var ORIG = {
+    efp: Document.prototype.elementFromPoint,
+    gbcr: Element.prototype.getBoundingClientRect,
+    focus: HTMLElement.prototype.focus,
+    dispatch: EventTarget.prototype.dispatchEvent,
+    reqSubmit: HTMLFormElement.prototype.requestSubmit,
+    scrollIntoView: Element.prototype.scrollIntoView,
+    MO: window.MutationObserver,
+    moObserve: window.MutationObserver.prototype.observe,
+    valueSet: Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype, 'value').set,
+    taValueSet: Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype, 'value').set,
+    now: (window.performance && performance.now)
+        ? performance.now.bind(performance) : function () { return 0; }
+  };
+
+  if (HOOKS) {
+    Document.prototype.elementFromPoint = function (x, y) {
+      bump('elementFromPoint', [Math.round(x), Math.round(y)]);
+      return ORIG.efp.call(this, x, y);
+    };
+    Element.prototype.getBoundingClientRect = function () {
+      bump('getBoundingClientRect', this.id || this.tagName);
+      return ORIG.gbcr.call(this);
+    };
+    HTMLElement.prototype.focus = function (opts) {
+      bump('focus', {id: this.id || this.tagName,
+                     preventScroll: !!(opts && opts.preventScroll)});
+      return ORIG.focus.call(this, opts);
+    };
+    Element.prototype.scrollIntoView = function (arg) {
+      bump('scrollIntoView', this.id || this.tagName);
+      return ORIG.scrollIntoView.call(this, arg);
+    };
+    EventTarget.prototype.dispatchEvent = function (ev) {
+      //: ⚠️ Тип события — самое ценное поле таблицы A: на уровне 1 все
+      //: до единого `dispatchEvent` оказались операциями канала наблюдателя,
+      //: а не синтетическими mouse-событиями.
+      bump('dispatchEvent', ev && ev.type);
+      return ORIG.dispatch.call(this, ev);
+    };
+    HTMLFormElement.prototype.requestSubmit = function (sub) {
+      bump('requestSubmit', sub && (sub.id || sub.tagName));
+      return ORIG.reqSubmit.call(this, sub);
+    };
+    window.MutationObserver.prototype.observe = function (t, o) {
+      bump('MutationObserver.observe',
+           {target: (t && (t.id || t.nodeName)) || null,
+            subtree: !!(o && o.subtree), childList: !!(o && o.childList),
+            attributes: !!(o && o.attributes)});
+      return ORIG.moObserve.call(this, t, o);
+    };
+    Object.defineProperty(HTMLInputElement.prototype, 'value', {
+      configurable: true,
+      get: Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype, 'value').get,
+      set: function (v) {
+        bump('input.value=', {id: this.id || null,
+                              len: (v === null || v === undefined)
+                                  ? 0 : String(v).length});
+        return ORIG.valueSet.call(this, v);
+      }
+    });
+  }
+
+  //: Пачка: сколько вызовов уместилось в самое плотное окно. Человек
+  //: не производит десятков `getBoundingClientRect` за миллисекунду.
+  function burst(ts) {
+    if (!ts.length) { return null; }
+    var best1 = 0, best16 = 0, i, j;
+    for (i = 0; i < ts.length; i++) {
+      for (j = i; j < ts.length && ts[j] - ts[i] <= 1.0; j++) { }
+      if (j - i > best1) { best1 = j - i; }
+      for (j = i; j < ts.length && ts[j] - ts[i] <= 16.0; j++) { }
+      if (j - i > best16) { best16 = j - i; }
+    }
+    return {max_per_1ms: best1, max_per_16ms: best16,
+            span_ms: Math.round(ts[ts.length - 1] - ts[0])};
+  }
+
+  function keysOf(obj) {
+    var out = [], k;
+    for (k in obj) { out.push(k); }
+    out.sort();
+    return out;
+  }
+
+  function windowSymbols() {
+    var out = [], syms, i;
+    try {
+      syms = Object.getOwnPropertySymbols(window);
+      for (i = 0; i < syms.length; i++) { out.push(String(syms[i])); }
+    } catch (e) { return null; }
+    return out;
+  }
+
+  //: ⚠️⚠️ Ключи `window` НА МОМЕНТ ЗАГРУЗКИ — снимок, сделанный страницей
+  //: ДО того, как кто-либо снаружи позвал `evaluate`. Без него «лишний
+  //: глобал» неотличим от бинда, который движок заводит на первом же
+  //: `evaluate`.
+  var BOOT_KEYS = null;
+
+  //: Имена, которые ищут детекторы драйвера. Проверяются ПО ИМЕНИ, а не
+  //: перечислением: неперечисляемое свойство перечислением не видно, а по
+  //: имени достаётся (ловушка rc70).
+  var DRIVER_NAMES = ['__pwInitScripts', '__playwright__binding__',
+                      '__playwright_builtins__', '__pw_force__',
+                      '_playwright', '__puppeteer_evaluation_script__',
+                      '__driver_evaluate', '__webdriver_evaluate',
+                      '__selenium_evaluate', '__fxdriver_evaluate',
+                      '__webdriver_script_fn', 'callPhantom', '_phantom',
+                      '__nightmare', 'domAutomation', 'domAutomationController'];
+
+  function driverGlobals() {
+    var found = {}, i, n;
+    for (i = 0; i < DRIVER_NAMES.length; i++) {
+      n = DRIVER_NAMES[i];
+      try { if (n in window) { found[n] = typeof window[n]; } }
+      catch (e) { found[n] = 'бросил'; }
+    }
+    return found;
+  }
+
+  function dumpA() {
+    var hits = {}, name, s;
+    for (name in H) {
+      s = H[name];
+      hits[name] = {n: s.n, detail: s.detail, burst: burst(s.ts)};
+    }
+    return {
+      mode: MODE,
+      hooks_installed: HOOKS,
+      hits: hits,
+      window_symbols: windowSymbols(),
+      window_keys: keysOf(window),
+      boot_window_keys: BOOT_KEYS,
+      driver_globals: driverGlobals(),
+      mo_note: 'наблюдатель библиотеки ставится через add_init_script, ' +
+               'то есть РАНЬШЕ хуков страницы; сюда попадает только ' +
+               'компенсирующий evaluate на уже загруженном документе'
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  Часть B: след ДВИЖКА — что выдаёт браузер сам по себе
+  // ══════════════════════════════════════════════════════════════════════
+
+  function isNative(fn) {
+    try {
+      return /\{\s*\[native code\]\s*\}\s*$/.test(
+          Function.prototype.toString.call(fn));
+    } catch (e) { return null; }
+  }
+
+  function runtimeEnableLeak() {
+    //: Детектор `Runtime.enable` — тот самый, ради которого существует
+    //: rebrowser. Источник формулировки: README rebrowser-patches.
+    var hit = false;
+    try {
+      var e = new Error(BUILD);
+      Object.defineProperty(e, 'stack', {
+        configurable: true,
+        get: function () { hit = true; return ''; }
+      });
+      console.debug(e);
+    } catch (err) { return null; }
+    return hit;
+  }
+
+  //: ⚠️ `permissions.query` асинхронен, поэтому спрашивается заранее
+  //: и кладётся в переменную: канал у нас синхронный.
+  var _permState = 'не отвечал';
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({name: 'notifications'}).then(
+          function (r) { _permState = r.state; },
+          function (e) { _permState = 'ошибка: ' + String(e && e.message); });
+    } else { _permState = 'нет API'; }
+  } catch (e) { _permState = 'бросил'; }
+
+  function dumpB() {
+    var nav = window.navigator;
+    var out = {
+      mode: MODE,
+      build: BUILD,
+      url: location.href,
+      user_agent: nav.userAgent,
+      webdriver: ('webdriver' in nav) ? nav.webdriver : 'нет свойства',
+      runtime_enable_leak: runtimeEnableLeak(),
+      native_code: {
+        'Function.prototype.toString': isNative(Function.prototype.toString),
+        'Element.prototype.getBoundingClientRect':
+            isNative(Element.prototype.getBoundingClientRect),
+        'Document.prototype.elementFromPoint':
+            isNative(Document.prototype.elementFromPoint),
+        'HTMLElement.prototype.focus': isNative(HTMLElement.prototype.focus),
+        'EventTarget.prototype.dispatchEvent':
+            isNative(EventTarget.prototype.dispatchEvent),
+        'MutationObserver': isNative(window.MutationObserver),
+        'navigator.permissions.query':
+            (nav.permissions ? isNative(nav.permissions.query) : null),
+        'Object.getOwnPropertyDescriptor':
+            isNative(Object.getOwnPropertyDescriptor)
+      },
+      plugins_len: (nav.plugins ? nav.plugins.length : null),
+      plugin_names: (function () {
+        var a = [], i;
+        if (!nav.plugins) { return null; }
+        for (i = 0; i < nav.plugins.length; i++) { a.push(nav.plugins[i].name); }
+        return a;
+      })(),
+      mime_types_len: (nav.mimeTypes ? nav.mimeTypes.length : null),
+      languages: nav.languages ? Array.prototype.slice.call(nav.languages) : null,
+      language: nav.language,
+      hardware_concurrency: nav.hardwareConcurrency,
+      device_memory: ('deviceMemory' in nav) ? nav.deviceMemory : null,
+      max_touch_points: nav.maxTouchPoints,
+      platform: nav.platform,
+      ua_data: (function () {
+        try {
+          if (!nav.userAgentData) { return null; }
+          return {brands: nav.userAgentData.brands,
+                  mobile: nav.userAgentData.mobile,
+                  platform: nav.userAgentData.platform};
+        } catch (e) { return 'бросил'; }
+      })(),
+      notification_permission:
+          (typeof Notification !== 'undefined') ? Notification.permission : null,
+      permissions_query: _permState,
+      cdc_window: (function () {
+        var a = [], k;
+        for (k in window) { if (k.indexOf('cdc_') === 0) { a.push(k); } }
+        return a;
+      })(),
+      cdc_document: (function () {
+        var a = [], k;
+        for (k in document) {
+          if (k.indexOf('$cdc_') === 0 || k.indexOf('cdc_') === 0) { a.push(k); }
+        }
+        return a;
+      })(),
+      driver_globals: driverGlobals(),
+      webgl_vendor: (function () {
+        try {
+          var c = document.createElement('canvas');
+          var gl = c.getContext('webgl');
+          var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          return dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null;
+        } catch (e) { return null; }
+      })(),
+      webgl_renderer: (function () {
+        try {
+          var c = document.createElement('canvas');
+          var gl = c.getContext('webgl');
+          var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          return dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null;
+        } catch (e) { return null; }
+      })(),
+      chrome_object: (typeof window.chrome === 'object' && window.chrome !== null)
+          ? Object.keys(window.chrome).sort() : null,
+      screen: {w: screen.width, h: screen.height,
+               availW: screen.availWidth, availH: screen.availHeight,
+               dpr: window.devicePixelRatio, colorDepth: screen.colorDepth},
+      outer_inner_delta: {w: window.outerWidth - window.innerWidth,
+                          h: window.outerHeight - window.innerHeight},
+      timezone: (function () {
+        try { return Intl.DateTimeFormat().resolvedOptions().timeZone; }
+        catch (e) { return null; }
+      })(),
+      boot_window_keys: BOOT_KEYS,
+      window_keys_now: keysOf(window),
+      window_symbols: windowSymbols()
+    };
+    return out;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  Часть C: подпись событий (компактная запись; полные таблицы — на стенде)
+  // ══════════════════════════════════════════════════════════════════════
+
+  var REC = [];
+  var MOUSE_TYPES = ['pointerover', 'pointerenter', 'pointerdown', 'pointermove',
+                     'pointerup', 'mouseover', 'mouseenter', 'mousedown',
+                     'mousemove', 'mouseup', 'click', 'dblclick', 'contextmenu'];
+  var KEY_TYPES = ['keydown', 'keypress', 'keyup'];
+  var OTHER_TYPES = ['wheel', 'input', 'change', 'focus', 'blur', 'scroll'];
+
+  function tgtId(e) {
+    var t = e.target;
+    if (!t) { return null; }
+    return t.id || (t.tagName ? t.tagName.toLowerCase() : null);
+  }
+
+  function on(e) {
+    if (REC.length >= CAP) { return; }
+    REC.push({
+      t: Math.round(ORIG.now() * 10) / 10,
+      ts: (typeof e.timeStamp === 'number')
+          ? Math.round(e.timeStamp * 10) / 10 : null,
+      type: e.type,
+      trusted: e.isTrusted === true,
+      id: tgtId(e),
+      x: (typeof e.clientX === 'number') ? Math.round(e.clientX) : null,
+      y: (typeof e.clientY === 'number') ? Math.round(e.clientY) : null,
+      sx: (typeof e.screenX === 'number') ? Math.round(e.screenX) : null,
+      btn: (typeof e.buttons === 'number') ? e.buttons : null,
+      //: ⚠️ `pressure === 0 && buttons === 1` — нарушение спеки Pointer
+      //: Events, читаемое ОДНОЙ строкой; под rebrowser так дают все уровни.
+      pres: (typeof e.pressure === 'number') ? e.pressure : null,
+      ptype: e.pointerType || null,
+      pid: (typeof e.pointerId === 'number') ? e.pointerId : null,
+      key: e.key || null,
+      code: e.code || null,
+      rep: e.repeat === true,
+      dy: (typeof e.deltaY === 'number') ? e.deltaY : null,
+      dx: (typeof e.deltaX === 'number') ? e.deltaX : null,
+      dmode: (typeof e.deltaMode === 'number') ? e.deltaMode : null,
+      itype: e.inputType || null,
+      vlen: (e.target && typeof e.target.value === 'string')
+          ? e.target.value.length : null,
+      sy: Math.round(window.scrollY)
+    });
+  }
+
+  function q(arr, p) {
+    if (!arr.length) { return null; }
+    var a = arr.slice().sort(function (x, y) { return x - y; });
+    var i = Math.min(a.length - 1, Math.max(0, Math.round((a.length - 1) * p)));
+    return Math.round(a[i] * 10) / 10;
+  }
+
+  //: Сводка считается ПО ЖУРНАЛУ на стороне страницы: владельцу нужен
+  //: короткий ответ, а не 6000 строк для ручного разбора. Сырой журнал
+  //: тоже отдаётся — командой `raw`.
+  function stats() {
+    var i, r, out = {
+      events_total: REC.length,
+      by_type: {}, trusted_by_type: {},
+      mouse_holds_ms: [], key_holds_ms: [], key_gaps_ms: [],
+      key_overlaps: 0, key_pairs: 0,
+      wheel_deltas: {}, wheel_series: [], wheel_ticks: 0,
+      pressure_violation: 0, press_without_move: null,
+      untrusted_examples: []
+    };
+    var downT = {}, keyDownT = {}, lastKeyDown = null, openKey = null;
+    var lastWheel = null, series = 0;
+    var movesBeforeFirstPress = 0, sawFirstPress = false;
+
+    for (i = 0; i < REC.length; i++) {
+      r = REC[i];
+      out.by_type[r.type] = (out.by_type[r.type] || 0) + 1;
+      if (r.trusted) {
+        out.trusted_by_type[r.type] = (out.trusted_by_type[r.type] || 0) + 1;
+      } else if (out.untrusted_examples.length < 40) {
+        out.untrusted_examples.push({type: r.type, id: r.id, t: r.t,
+                                     x: r.x, y: r.y, key: r.key});
+      }
+
+      if (r.type === 'mousemove' && !sawFirstPress) { movesBeforeFirstPress++; }
+
+      if (r.type === 'mousedown') {
+        sawFirstPress = true;
+        downT[r.id || '_'] = r.ts !== null ? r.ts : r.t;
+      }
+      if (r.type === 'mouseup') {
+        var d0 = downT[r.id || '_'];
+        if (d0 !== undefined) {
+          out.mouse_holds_ms.push(Math.round(((r.ts !== null ? r.ts : r.t) - d0) * 10) / 10);
+          delete downT[r.id || '_'];
+        }
+      }
+      if (r.type === 'pointerdown' && r.pres === 0 && r.btn === 1) {
+        out.pressure_violation++;
+      }
+
+      if (r.type === 'keydown' && !r.rep) {
+        var kt = r.ts !== null ? r.ts : r.t;
+        if (openKey !== null && keyDownT[openKey] !== undefined) {
+          //: Перекрытие: следующая клавиша НАЖАТА раньше, чем отпущена
+          //: предыдущая. У человека 7…15 % пар.
+          out.key_overlaps++;
+        }
+        if (lastKeyDown !== null) {
+          out.key_gaps_ms.push(Math.round((kt - lastKeyDown) * 10) / 10);
+          out.key_pairs++;
+        }
+        lastKeyDown = kt;
+        keyDownT[r.key] = kt;
+        openKey = r.key;
+      }
+      if (r.type === 'keyup') {
+        var k0 = keyDownT[r.key];
+        if (k0 !== undefined) {
+          out.key_holds_ms.push(
+              Math.round(((r.ts !== null ? r.ts : r.t) - k0) * 10) / 10);
+          delete keyDownT[r.key];
+          if (openKey === r.key) { openKey = null; }
+        }
+      }
+
+      if (r.type === 'wheel') {
+        out.wheel_ticks++;
+        var key = String(r.dy);
+        out.wheel_deltas[key] = (out.wheel_deltas[key] || 0) + 1;
+        if (lastWheel !== null && (r.t - lastWheel) > 300) {
+          out.wheel_series.push(series);
+          series = 0;
+        }
+        series++;
+        lastWheel = r.t;
+      }
+    }
+    if (series) { out.wheel_series.push(series); }
+    out.press_without_move = sawFirstPress ? movesBeforeFirstPress : null;
+
+    out.summary = {
+      mouse_hold_p50: q(out.mouse_holds_ms, 0.5),
+      mouse_hold_min: out.mouse_holds_ms.length ? Math.min.apply(null, out.mouse_holds_ms) : null,
+      key_hold_p50: q(out.key_holds_ms, 0.5),
+      key_hold_min: out.key_holds_ms.length ? Math.min.apply(null, out.key_holds_ms) : null,
+      key_gap_p50: q(out.key_gaps_ms, 0.5),
+      key_overlap_share: out.key_pairs
+          ? Math.round(out.key_overlaps / out.key_pairs * 1000) / 10 : null,
+      wheel_series: out.wheel_series,
+      untrusted_total: REC.length - Object.keys(out.trusted_by_type)
+          .reduce(function (a, k) { return a + out.trusted_by_type[k]; }, 0)
+    };
+    //: Полные массивы удержаний в дампе НЕ нужны — только квантили и края.
+    delete out.mouse_holds_ms;
+    delete out.key_holds_ms;
+    delete out.key_gaps_ms;
+    return out;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  Положительный контроль инструмента
+  // ══════════════════════════════════════════════════════════════════════
+
+  //: ⚠️⚠️ Прибор, не способный дать не-ноль, ничего не утверждает:
+  //: `selftest` зовёт каждый хук РОВНО ОДИН раз со стороны страницы.
+  //: Без него «все нули» и «хуки не встали» неотличимы.
+  function selftest() {
+    var el = document.getElementById('atc');
+    var inp = document.getElementById('q');
+    if (!el || !inp) { return false; }
+    document.elementFromPoint(5, 5);
+    el.getBoundingClientRect();
+    el.focus({preventScroll: true});
+    inp.value = 'selftest';
+    el.dispatchEvent(new CustomEvent('rc93-selftest', {bubbles: true}));
+    var mo = new MutationObserver(function () { });
+    mo.observe(document.body, {childList: true});
+    mo.disconnect();
+    //: `requestSubmit` НЕ зовём: он перезагрузил бы документ вместе с журналом.
+    return true;
+  }
+
+  function dumpAll() {
+    return {build: BUILD, mode: MODE, taken_at_ms: Math.round(ORIG.now()),
+            page: {scrollY: Math.round(window.scrollY),
+                   inner: {w: window.innerWidth, h: window.innerHeight},
+                   banner_open: !!document.getElementById('cookie-banner') &&
+                       document.getElementById('cookie-banner').style.display !== 'none',
+                   cart: (document.getElementById('cart-count') || {}).textContent},
+            A: dumpA(), B: dumpB(), C: stats()};
+  }
+
+  window.__ht_detector = {dump: dumpAll, dumpA: dumpA, dumpB: dumpB,
+                          stats: stats, selftest: selftest,
+                          raw: function () { return REC; }};
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  Канал со страницей — ЧЕРЕЗ ДОМ, а не через глобал
+  // ══════════════════════════════════════════════════════════════════════
+  //: ⚠️⚠️ `page.evaluate` под patchright исполняется в ИЗОЛИРОВАННОМ мире,
+  //: где глобалов страницы НЕТ ВОВСЕ (rc80). ДОМ у миров общий — поэтому
+  //: команда приходит атрибутом на <html>, а ответ читается из <textarea>.
+  //: ⚠️ Канал ходит через СОХРАНЁННЫЕ оригиналы: он ставит свой `observe`
+  //: и пишет в textarea, то есть мимо собственных хуков. Иначе контрольное
+  //: плечо перестало бы быть нулевым.
+  function setOut(el, v) { ORIG.taValueSet.call(el, v); }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    BOOT_KEYS = keysOf(window);
+    var root = document.documentElement;
+    var out = document.getElementById('ht_out');
+    var i;
+
+    for (i = 0; i < MOUSE_TYPES.length; i++) {
+      //: Пассивно и в фазе CAPTURE: так это увидел бы сайт раньше всех
+      //: своих обработчиков. `preventDefault` не зовётся нигде.
+      window.addEventListener(MOUSE_TYPES[i], on, {capture: true, passive: true});
+    }
+    for (i = 0; i < KEY_TYPES.length; i++) {
+      window.addEventListener(KEY_TYPES[i], on, {capture: true, passive: true});
+    }
+    for (i = 0; i < OTHER_TYPES.length; i++) {
+      window.addEventListener(OTHER_TYPES[i], on, {capture: true, passive: true});
+    }
+
+    var chanObs = new ORIG.MO(function () {
+      var cmd = root.getAttribute('data-ht-cmd');
+      if (!cmd) { return; }
+      root.removeAttribute('data-ht-cmd');
+      try {
+        if (cmd === 'ping') { setOut(out, '1'); }
+        else if (cmd === 'mode') { setOut(out, MODE); }
+        else if (cmd === 'build') { setOut(out, BUILD); }
+        else if (cmd === 'reset') { H = {}; REC.length = 0; setOut(out, '1'); }
+        else if (cmd === 'selftest') { setOut(out, selftest() ? '1' : '0'); }
+        else if (cmd === 'dump') { setOut(out, JSON.stringify(dumpAll())); }
+        else if (cmd === 'raw') { setOut(out, JSON.stringify(REC)); }
+        else { setOut(out, ''); }
+        root.setAttribute('data-ht-ack', cmd);
+      } catch (e) {
+        setOut(out, JSON.stringify({error: String((e && e.message) || e)}));
+        root.setAttribute('data-ht-ack', 'error');
+      }
+    });
+    ORIG.moObserve.call(chanObs, root,
+                        {attributes: true, attributeFilter: ['data-ht-cmd']});
+  });
+})();
+</script>
+
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+         background: #fafafa; color: #1a1a1a; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 20px 16px 80px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  .sub { color: #666; margin: 0 0 18px; }
+  .card { background: #fff; border: 1px solid #e3e3e3; border-radius: 8px;
+          padding: 16px; margin: 0 0 14px; }
+  .spacer { height: 1500px; background: repeating-linear-gradient(
+      180deg, #f4f4f4 0 60px, #efefef 60px 120px);
+      border-radius: 8px; margin: 0 0 14px; display: flex;
+      align-items: center; justify-content: center; color: #aaa; }
+  #atc { padding: 14px 22px; font-size: 16px; cursor: pointer;
+         background: #1f6feb; color: #fff; border: 0; border-radius: 6px; }
+  #atc:hover { background: #1a5fd0; }
+  input.f { width: 280px; height: 38px; font-size: 15px; padding: 0 10px;
+            border: 1px solid #ccc; border-radius: 6px; }
+  #ht_out { width: 100%; height: 140px; font: 11px/1.35 ui-monospace, monospace; }
+  button.ui { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+  code { font: 12.5px/1.3 ui-monospace, monospace; background: #f3f3f3;
+         padding: 1px 5px; border-radius: 3px; }
+  #cookie-banner { position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999;
+      background: #23262b; color: #fff; padding: 14px 16px; display: flex;
+      gap: 12px; align-items: center; justify-content: center; }
+  #cookie-banner button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+  .toast { position: fixed; right: 16px; top: 16px; background: #128a48;
+           color: #fff; padding: 10px 14px; border-radius: 6px; z-index: 9998; }
+  .muted { color: #777; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<!-- Баннер: цель для `dismiss_spam`. Селекторы намеренно такие же банальные,
+     как на настоящих сайтах. -->
+<div id="cookie-banner">
+  <span>Мы используем cookie.</span>
+  <button id="cookie-accept" class="cookie-close" type="button">Принять</button>
+  <button id="cookie-close" aria-label="Close" type="button">×</button>
+</div>
+
+<div class="wrap">
+  <h1>humanly_testing — прод-детектор <span class="muted">rc93</span></h1>
+  <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
+  <code>main_tasks</code> через DOM-мост.</p>
+
+  <div class="card">
+    <h2>Режимы</h2>
+    <p>Открывать ДВА раза, разными адресами — иначе хуки таблицы A испортят
+    ответы таблицы B:</p>
+    <p><code>?mode=engine</code> — след движка (по умолчанию)<br>
+       <code>?mode=api</code> — плюс хуки: что страница видит от библиотеки</p>
+  </div>
+
+  <div class="card">
+    <h2>DOM-мост</h2>
+    <p>Команда — атрибут <code>data-ht-cmd</code> на <code>&lt;html&gt;</code>,
+    ответ — значение <code>#ht_out</code>, подтверждение —
+    <code>data-ht-ack</code>.</p>
+    <p class="muted">Команды: <code>ping</code>, <code>mode</code>,
+    <code>build</code>, <code>reset</code>, <code>selftest</code>,
+    <code>dump</code>, <code>raw</code>.</p>
+  </div>
+
+  <div class="spacer">цель ниже сгиба — сюда надо доскроллить</div>
+
+  <div class="card">
+    <h2>Корзина</h2>
+    <button id="atc" type="button">Add to Cart</button>
+    <p class="muted">В корзине: <span id="cart-count">0</span></p>
+  </div>
+
+  <div class="card">
+    <h2>Поля</h2>
+    <p><input id="q" class="f" type="text" placeholder="сюда вводить строку"></p>
+    <p><input id="q2" class="f" type="text" placeholder="по этому полю кликнуть"></p>
+  </div>
+
+  <div class="card">
+    <h2>Дамп</h2>
+    <p>
+      <button class="ui" id="btn-dump" type="button">Снять дамп</button>
+      <button class="ui" id="btn-reset" type="button">Сбросить журнал</button>
+    </p>
+    <textarea id="ht_out" spellcheck="false"></textarea>
+  </div>
+</div>
+
+<script>
+//: Кнопки — только для ручной проверки человеком. Автоматизация ходит
+//: мостом: ей кнопки не нужны, а лишний клик по ним попал бы в журнал.
+(function () {
+  var banner = document.getElementById('cookie-banner');
+  function hide() { banner.style.display = 'none'; }
+  document.getElementById('cookie-accept').addEventListener('click', hide);
+  document.getElementById('cookie-close').addEventListener('click', hide);
+
+  var n = 0;
+  document.getElementById('atc').addEventListener('click', function () {
+    //: Сайт отвечает НЕ мгновенно — как настоящий: счётчик и тост
+    //: появляются через 400 мс. Это даёт каскаду библиотеки нормальный
+    //: путь успеха (target-scoped мутация + видимый маркер).
+    setTimeout(function () {
+      n += 1;
+      document.getElementById('cart-count').textContent = String(n);
+      var t = document.createElement('div');
+      t.className = 'toast message-success';
+      t.textContent = 'Товар добавлен';
+      document.body.appendChild(t);
+      setTimeout(function () {
+        if (t.parentNode) { t.parentNode.removeChild(t); }
+      }, 2500);
+    }, 400);
+  });
+
+  document.getElementById('btn-dump').addEventListener('click', function () {
+    document.getElementById('ht_out').value =
+        JSON.stringify(window.__ht_detector.dump(), null, 1);
+  });
+  document.getElementById('btn-reset').addEventListener('click', function () {
+    document.documentElement.setAttribute('data-ht-cmd', 'reset');
+  });
+})();
+</script>
+</body>
+</html>
