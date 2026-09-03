@@ -4,13 +4,32 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>humanly_testing — прод-детектор rc93</title>
+<title>humanly_testing — прод-детектор (страница page-rc96)</title>
 
 <!--
-  rc93 §2. ПУБЛИЧНАЯ версия стенда: та же логика, что у
+  rc93 §2, ред. rc96. ПУБЛИЧНАЯ версия стенда: та же логика, что у
   tests/fixtures/detector_api_v1.html (таблицы A и B) плюс компактная запись
   подписи событий, но по HTTPS-адресу — потому что боевой браузер живёт
   в Octo, ходит через прокси и до нашего диска не достаёт.
+
+  ⚠️⚠️ `page_build` — ВЕРСИЯ ЭТОЙ СТРАНИЦЫ, а не библиотеки. Прежнее имя
+  поля было `build`, и его один раз прочитали как версию пакета: свойство
+  ПРИБОРА приняли за свойство ПРЕДМЕТА. Версия библиотеки приезжает командой
+  моста `lib=<версия>` и лежит отдельным полем `lib_version`; `null` там
+  значит «харнесс не передал».
+
+  ⚠️⚠️ Прогон = ДЕСЯТЬ ПОВТОРОВ последовательности на ОДНОМ документе,
+  затем ОДИН дамп. Границу повтора ставит команда моста `rearm` (баннер
+  снова виден, поля снова пусты), и она же считает повторы: `repeat_hint`
+  в дампе — сколько их было НА САМОМ ДЕЛЕ.
+
+  ⚠️⚠️ Всё, чем страница отвечает на действие, обязано менять ДЕРЕВО, а не
+  только свойства объектов. Присваивание `.value` мутации не порождает,
+  и до rc96 успешный клик по кнопке дампа стоил 41.7 с и заканчивался
+  `ActionFailed`: каскаду библиотеки нечего было увидеть. Отсюда счётчик
+  дампов, строка о снятом дампе и подсказка под вторым полем — и все они
+  лежат ВНУТРИ того же <p>, что и цель (target-scope пути 2A — это
+  `tgt.parentElement`, а не карточка).
 
   ⚠️⚠️ РЕЖИМЫ РАЗДЕЛЕНЫ ПАРАМЕТРОМ URL, и это НЕ удобство (правило rc89).
   Проверки B читают, остались ли нативные функции нативными
@@ -41,8 +60,26 @@
 
   var MODE = (location.search.indexOf('mode=api') >= 0) ? 'api' : 'engine';
   var HOOKS = (MODE === 'api');
-  var CAP = 6000;                       // кап на журнал событий
-  var BUILD = 'rc93';
+  //: ⚠️⚠️ КАП СЧИТАН ОТ ПОВТОРОВ, А НЕ ВЗЯТ КРУГЛЫМ. Один повтор
+  //: последовательности из шести шагов даёт ~900 событий (замер стенда:
+  //: 1816 за два повтора), десять повторов — ~9 000. Прежние 6 000
+  //: обрезали бы журнал МОЛЧА посреди прогона, и все доли (перекрытие
+  //: клавиш, серии колеса) считались бы по первым повторам.
+  var CAP = 40000;                      // кап на журнал событий
+  //: Отброшенное считается и попадает в дамп: прибор обязан сказать, что
+  //: он перестал мерить, а не тихо отдать усечённую выборку.
+  var DROPPED = 0;
+  //: Сколько раз харнесс сказал `rearm`, то есть сколько ПОВТОРОВ
+  //: последовательности начато на ЭТОМ документе. Дамп обязан
+  //: утверждать не только величину, но и обстоятельства прогона.
+  var REPEATS_SEEN = 0;
+  //: ⚠️⚠️ ЭТО ВЕРСИЯ СТРАНИЦЫ, А НЕ БИБЛИОТЕКИ (rc96-доп. §0). Прежнее имя
+  //: поля было `build`, и его прочитали как версию пакета — прибор приняли
+  //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
+  //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
+  //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
+  var PAGE_BUILD = 'page-rc96';
+  var LIB_VERSION = null;
 
   // ══════════════════════════════════════════════════════════════════════
   //  Часть A: НАШ след — какие API страница видит от кода библиотеки
@@ -223,7 +260,7 @@
     //: rebrowser. Источник формулировки: README rebrowser-patches.
     var hit = false;
     try {
-      var e = new Error(BUILD);
+      var e = new Error(PAGE_BUILD);
       Object.defineProperty(e, 'stack', {
         configurable: true,
         get: function () { hit = true; return ''; }
@@ -248,7 +285,8 @@
     var nav = window.navigator;
     var out = {
       mode: MODE,
-      build: BUILD,
+      page_build: PAGE_BUILD,
+      lib_version: LIB_VERSION,
       url: location.href,
       user_agent: nav.userAgent,
       webdriver: ('webdriver' in nav) ? nav.webdriver : 'нет свойства',
@@ -358,7 +396,7 @@
   }
 
   function on(e) {
-    if (REC.length >= CAP) { return; }
+    if (REC.length >= CAP) { DROPPED += 1; return; }
     REC.push({
       t: Math.round(ORIG.now() * 10) / 10,
       ts: (typeof e.timeStamp === 'number')
@@ -401,11 +439,12 @@
   function stats() {
     var i, r, out = {
       events_total: REC.length,
+      events_dropped: DROPPED,
       by_type: {}, trusted_by_type: {},
       mouse_holds_ms: [], key_holds_ms: [], key_gaps_ms: [],
       key_overlaps: 0, key_pairs: 0,
       wheel_deltas: {}, wheel_series: [], wheel_ticks: 0,
-      pressure_violation: 0, press_without_move: null,
+      pressure_violation: 0, moves_before_first_press: null,
       untrusted_examples: []
     };
     var downT = {}, keyDownT = {}, lastKeyDown = null, openKey = null;
@@ -477,7 +516,13 @@
       }
     }
     if (series) { out.wheel_series.push(series); }
-    out.press_without_move = sawFirstPress ? movesBeforeFirstPress : null;
+    //: ⚠️⚠️ ИМЯ ПЕРЕИМЕНОВАНО (rc96 §5): считалось всегда одно — сколько
+    //: `mousemove` пришло ДО ПЕРВОГО `mousedown` документа. Прежнее
+    //: `press_without_move` читалось как «нажатий без движения», и число
+    //: 73 при четырёх нажатиях не читалось никак. Это величина ПРО ОДНО
+    //: нажатие — первое; при десяти повторах она о повторе №1, а не
+    //: о прогоне.
+    out.moves_before_first_press = sawFirstPress ? movesBeforeFirstPress : null;
 
     out.summary = {
       mouse_hold_p50: q(out.mouse_holds_ms, 0.5),
@@ -521,8 +566,57 @@
     return true;
   }
 
+  // ══════════════════════════════════════════════════════════════════════
+  //  Видимый след дампа и пере-взвод фикстуры
+  // ══════════════════════════════════════════════════════════════════════
+
+  //: ⚠️⚠️ ДАМП ОБЯЗАН МЕНЯТЬ ДЕРЕВО (rc96 §4.1). Прежняя кнопка писала
+  //: результат только в `value` поля, а присваивание `.value` DOM-мутации
+  //: НЕ порождает: каскад библиотеки не видел ни одного пути (L1, 2A/2B,
+  //: 2C, 2N), проходил все уровни, тратил 41.7 с и кончался `ActionFailed`
+  //: на клике, который на самом деле СРАБОТАЛ.
+  //: ⚠️ Мутацию, которую УВИДИТ каскад, даёт счётчик `#dump-count`: он лежит
+  //: в том же <p>, что и кнопка, а target-scope пути 2A — это
+  //: `tgt.closest(семантический контейнер) || tgt.parentElement`, и карточка
+  //: `.card` в тот список НЕ входит. Строка истории в `#dump-log` — для
+  //: человека; на вердикт она не работает.
+  function noteDump(chars) {
+    var n = document.getElementById('dump-count');
+    var log = document.getElementById('dump-log');
+    var d = new Date();
+    var stamp = ('0' + d.getHours()).slice(-2) + ':' +
+                ('0' + d.getMinutes()).slice(-2) + ':' +
+                ('0' + d.getSeconds()).slice(-2);
+    if (n) { n.textContent = String((parseInt(n.textContent, 10) || 0) + 1); }
+    if (log) {
+      var row = document.createElement('div');
+      row.className = 'dump-note';
+      row.textContent = stamp + ' — дамп снят, ' + chars + ' симв.';
+      log.appendChild(row);
+    }
+  }
+
+  //: Пере-взвод перед КАЖДЫМ повтором: баннер снова виден, поля снова пусты.
+  //: ⚠️ Значения полей чистятся СОХРАНЁННЫМ сеттером: пойди это через хук
+  //: таблицы A, фикстура считала бы собственные вызовы своими же и
+  //: контрольное плечо перестало бы быть нулевым.
+  function rearm() {
+    var b = document.getElementById('cookie-banner');
+    var hint = document.getElementById('q2-hint');
+    var fields = ['q', 'q2'], el, i;
+    if (b) { b.style.display = ''; }
+    if (hint) { hint.hidden = true; }
+    for (i = 0; i < fields.length; i++) {
+      el = document.getElementById(fields[i]);
+      if (el) { ORIG.valueSet.call(el, ''); }
+    }
+    REPEATS_SEEN += 1;
+    return true;
+  }
+
   function dumpAll() {
-    return {build: BUILD, mode: MODE, taken_at_ms: Math.round(ORIG.now()),
+    return {page_build: PAGE_BUILD, lib_version: LIB_VERSION, mode: MODE,
+            repeat_hint: REPEATS_SEEN, taken_at_ms: Math.round(ORIG.now()),
             page: {scrollY: Math.round(window.scrollY),
                    inner: {w: window.innerWidth, h: window.innerHeight},
                    banner_open: !!document.getElementById('cookie-banner') &&
@@ -532,7 +626,8 @@
   }
 
   window.__ht_detector = {dump: dumpAll, dumpA: dumpA, dumpB: dumpB,
-                          stats: stats, selftest: selftest,
+                          stats: stats, selftest: selftest, rearm: rearm,
+                          note: noteDump,
                           raw: function () { return REC; }};
 
   // ══════════════════════════════════════════════════════════════════════
@@ -571,10 +666,24 @@
       try {
         if (cmd === 'ping') { setOut(out, '1'); }
         else if (cmd === 'mode') { setOut(out, MODE); }
-        else if (cmd === 'build') { setOut(out, BUILD); }
-        else if (cmd === 'reset') { H = {}; REC.length = 0; setOut(out, '1'); }
+        else if (cmd === 'page_build') { setOut(out, PAGE_BUILD); }
+        //: `lib=<версия>` — единственный вход для версии БИБЛИОТЕКИ:
+        //: страница её не знает и знать не может (rc96-доп. §0).
+        else if (cmd.indexOf('lib=') === 0) {
+          LIB_VERSION = cmd.slice(4);
+          setOut(out, LIB_VERSION);
+        }
+        else if (cmd === 'rearm') { setOut(out, rearm() ? '1' : '0'); }
+        else if (cmd === 'reset') {
+          H = {}; REC.length = 0; DROPPED = 0; REPEATS_SEEN = 0;
+          setOut(out, '1');
+        }
         else if (cmd === 'selftest') { setOut(out, selftest() ? '1' : '0'); }
-        else if (cmd === 'dump') { setOut(out, JSON.stringify(dumpAll())); }
+        else if (cmd === 'dump') {
+          var payload = JSON.stringify(dumpAll());
+          setOut(out, payload);
+          noteDump(payload.length);
+        }
         else if (cmd === 'raw') { setOut(out, JSON.stringify(REC)); }
         else { setOut(out, ''); }
         root.setAttribute('data-ht-ack', cmd);
@@ -619,6 +728,7 @@
   .toast { position: fixed; right: 16px; top: 16px; background: #128a48;
            color: #fff; padding: 10px 14px; border-radius: 6px; z-index: 9998; }
   .muted { color: #777; font-size: 13px; }
+  .dump-note { color: #128a48; font-size: 12.5px; margin: 2px 0 0; }
 </style>
 </head>
 <body>
@@ -632,7 +742,7 @@
 </div>
 
 <div class="wrap">
-  <h1>humanly_testing — прод-детектор <span class="muted">rc93</span></h1>
+  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc96</span></h1>
   <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
   <code>main_tasks</code> через DOM-мост.</p>
 
@@ -650,8 +760,14 @@
     ответ — значение <code>#ht_out</code>, подтверждение —
     <code>data-ht-ack</code>.</p>
     <p class="muted">Команды: <code>ping</code>, <code>mode</code>,
-    <code>build</code>, <code>reset</code>, <code>selftest</code>,
+    <code>page_build</code>, <code>lib=&lt;версия&gt;</code>,
+    <code>rearm</code>, <code>reset</code>, <code>selftest</code>,
     <code>dump</code>, <code>raw</code>.</p>
+    <p class="muted">⚠️ <code>page_build</code> — версия ЭТОЙ СТРАНИЦЫ.
+    Версию библиотеки страница не знает: её присылает харнесс командой
+    <code>lib=</code>, и в дампе она лежит полем <code>lib_version</code>.
+    <code>rearm</code> — начать очередной повтор: баннер снова показан,
+    поля снова пусты.</p>
   </div>
 
   <div class="spacer">цель ниже сгиба — сюда надо доскроллить</div>
@@ -665,7 +781,18 @@
   <div class="card">
     <h2>Поля</h2>
     <p><input id="q" class="f" type="text" placeholder="сюда вводить строку"></p>
-    <p><input id="q2" class="f" type="text" placeholder="по этому полю кликнуть"></p>
+    <!-- ⚠️ Подсказка существует ради того же, ради чего запись о дампе:
+         клик по пустому полю сам по себе дерево НЕ меняет, и каскад
+         библиотеки честно объявлял такой клик провалом («No native changes
+         detected»), тратя на ретрай весь потолок вызова. На настоящих
+         сайтах поле под фокусом почти всегда чем-нибудь отвечает.
+         ⚠️⚠️ Она лежит В ТОМ ЖЕ <p>, что и поле, и это не вёрстка:
+         target-scope пути 2A — `tgt.closest(семантический контейнер)
+         || tgt.parentElement`, а `.card` в тот список не входит. Узел
+         снаружи <p> засчитался бы только глобальному счётчику, которому
+         нужны порог 3 и корроборация. -->
+    <p><input id="q2" class="f" type="text" placeholder="по этому полю кликнуть">
+       <span id="q2-hint" class="muted" hidden>Начните вводить — покажем варианты</span></p>
   </div>
 
   <div class="card">
@@ -673,7 +800,11 @@
     <p>
       <button class="ui" id="btn-dump" type="button">Снять дамп</button>
       <button class="ui" id="btn-reset" type="button">Сбросить журнал</button>
+      <span class="muted">снято дампов: <span id="dump-count">0</span></span>
     </p>
+    <!-- ⚠️ Узлы ниже существуют ради каскада библиотеки, а не ради красоты:
+         клик по «Снять дамп» обязан оставить след В ДЕРЕВЕ (rc96 §4.1). -->
+    <div id="dump-log"></div>
     <textarea id="ht_out" spellcheck="false"></textarea>
   </div>
 </div>
@@ -705,9 +836,25 @@
     }, 400);
   });
 
+  var hint = document.getElementById('q2-hint');
+  var hintTimer = null;
+  document.getElementById('q2').addEventListener('focus', function () {
+    //: Не мгновенно — как настоящий сайт: у каскада появляется нормальный
+    //: путь успеха (target-scoped мутация), а не гонка.
+    hintTimer = setTimeout(function () { hint.hidden = false; }, 250);
+  });
+  document.getElementById('q2').addEventListener('blur', function () {
+    if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
+    hint.hidden = true;
+  });
+
   document.getElementById('btn-dump').addEventListener('click', function () {
-    document.getElementById('ht_out').value =
-        JSON.stringify(window.__ht_detector.dump(), null, 1);
+    var payload = JSON.stringify(window.__ht_detector.dump(), null, 1);
+    document.getElementById('ht_out').value = payload;
+    //: ⚠️⚠️ Вторая строка — не косметика. Присваивание `.value` дерево
+    //: НЕ меняет, поэтому до rc96 успешный клик по этой кнопке стоил 41.7 с
+    //: и заканчивался `ActionFailed`: каскаду нечего было увидеть.
+    window.__ht_detector.note(payload.length);
   });
   document.getElementById('btn-reset').addEventListener('click', function () {
     document.documentElement.setAttribute('data-ht-cmd', 'reset');
