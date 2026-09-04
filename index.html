@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>humanly_testing — прод-детектор (страница page-rc96)</title>
+<title>humanly_testing — прод-детектор (страница page-rc101)</title>
 
 <!--
-  rc93 §2, ред. rc96. ПУБЛИЧНАЯ версия стенда: та же логика, что у
+  rc93 §2, ред. rc101. ПУБЛИЧНАЯ версия стенда: та же логика, что у
   tests/fixtures/detector_api_v1.html (таблицы A и B) плюс компактная запись
   подписи событий, но по HTTPS-адресу — потому что боевой браузер живёт
   в Octo, ходит через прокси и до нашего диска не достаёт.
@@ -66,6 +66,10 @@
   //: обрезали бы журнал МОЛЧА посреди прогона, и все доли (перекрытие
   //: клавиш, серии колеса) считались бы по первым повторам.
   var CAP = 40000;                      // кап на журнал событий
+  //: Кап последовательности тиков. Человеческая сессия дала 818 тиков,
+  //: десять повторов библиотеки — порядка двухсот; 2000 покрывает оба
+  //: с запасом и стоит ~36 КБ в дампе.
+  var WHEEL_SEQ_CAP = 2000;
   //: Отброшенное считается и попадает в дамп: прибор обязан сказать, что
   //: он перестал мерить, а не тихо отдать усечённую выборку.
   var DROPPED = 0;
@@ -78,7 +82,7 @@
   //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
   //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
   //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
-  var PAGE_BUILD = 'page-rc96';
+  var PAGE_BUILD = 'page-rc101';
   var LIB_VERSION = null;
 
   // ══════════════════════════════════════════════════════════════════════
@@ -181,11 +185,51 @@
             span_ms: Math.round(ts[ts.length - 1] - ts[0])};
   }
 
+  //: ⚠️⚠️ ЭТО `for...in`, И ОН СЛЕП К НЕПЕРЕЧИСЛИМЫМ ИМЕНАМ (rc101 §1).
+  //: Восемь релизов подряд строка «имени нет ни в одном списке ключей»
+  //: описывала ПРИБОР, а не страницу: `__playwright_builtins__` лежит
+  //: на `window` собственным неперечислимым свойством, и `for...in` его
+  //: не видит НИКОГДА. Функция оставлена как есть — по ней сравниваются
+  //: старые дампы; рядом появился второй способ.
   function keysOf(obj) {
     var out = [], k;
     for (k in obj) { out.push(k); }
     out.sort();
     return out;
+  }
+
+  //: ⚠️⚠️ `Object.getOwnPropertyNames` перечисляет и НЕперечислимые
+  //: собственные свойства — то есть видит то, что `for...in` пропускает.
+  //: Это ДРУГОЙ класс наблюдаемых, а не улучшение прежнего: детектору
+  //: не нужен список известных имён, ему достаточно разницы с чистым
+  //: профилем.
+  function ownNamesOf(obj) {
+    try { return Object.getOwnPropertyNames(obj).sort(); }
+    catch (e) { return null; }
+  }
+
+  //: ⚠️⚠️ ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ ОБОИХ СПИСКОВ. Страница САМА заводит
+  //: заведомо неперечислимое свойство: оно ОБЯЗАНО быть в `own_names`
+  //: и ОБЯЗАНО отсутствовать в `keys`. Без него «в own_names ничего
+  //: лишнего» неотличимо от «own_names не работает», а это ровно та
+  //: слепота, ради которой раздел и заведён.
+  var NONENUM_PROBE = '__ht_nonenum_probe_v1';
+  function installNonenumProbe() {
+    try {
+      Object.defineProperty(window, NONENUM_PROBE, {
+        value: 1, enumerable: false, configurable: true, writable: false});
+    } catch (e) { /* не вышло — увидим по in_own_names: false */ }
+  }
+  function nonenumProbe() {
+    var inKeys = false, inOwn = false, k;
+    try { for (k in window) { if (k === NONENUM_PROBE) { inKeys = true; break; } } }
+    catch (e) { inKeys = 'бросил'; }
+    try {
+      inOwn = Object.getOwnPropertyNames(window).indexOf(NONENUM_PROBE) >= 0;
+    } catch (e) { inOwn = 'бросил'; }
+    return {name: NONENUM_PROBE, in_for_in: inKeys, in_own_names: inOwn,
+            note: 'in_own_names=true и in_for_in=false — оба списка исправны; ' +
+                  'in_own_names=false — own_names не утверждает ничего'};
   }
 
   function windowSymbols() {
@@ -202,6 +246,11 @@
   //: глобал» неотличим от бинда, который движок заводит на первом же
   //: `evaluate`.
   var BOOT_KEYS = null;
+  //: Те же снимки вторым способом. Снимаются В ТОТ ЖЕ МОМЕНТ, иначе
+  //: разность двух списков окажется разностью двух моментов.
+  var BOOT_OWN = null;
+  var BOOT_DOC_KEYS = null;
+  var BOOT_DOC_OWN = null;
 
   //: Имена, которые ищут детекторы драйвера. Проверяются ПО ИМЕНИ, а не
   //: перечислением: неперечисляемое свойство перечислением не видно, а по
@@ -223,6 +272,64 @@
     }
     return found;
   }
+
+  //: ⚠️⚠️ ЧАСОВОЙ НАД КЛЮЧАМИ `window` (rc97 §4). Пара «на загрузке нет —
+  //: к дампу есть» говорит, что глобал ПОЯВИЛСЯ, и не говорит, ОТ ЧЕГО:
+  //: между загрузкой и дампом лежит всё сразу — навигация, первый резолв
+  //: локатора, первый `evaluate`, действия. Часовой записывает МОМЕНТ
+  //: первого появления каждого имени; харнесс разносит фазы паузами, и имя
+  //: приписывается фазе по времени. Это ровно требование «привязать
+  //: наблюдаемую к событию, существующему ТОЛЬКО в измеряемой точке».
+  //: ⚠️ Перечислимые имена ищутся for-in, имена драйвера — ПО ИМЕНИ (`in`):
+  //: неперечисляемое свойство перечислением не видно (ловушка rc70).
+  //: ⚠️⚠️ ПЕРВЫЙ проход — база, и в линию он НЕ пишется: иначе двести
+  //: штатных имён вытеснили бы из-под капа те несколько, ради которых
+  //: часовой и заведён.
+  //: ⚠️ Прибор обязан утверждать, что он мерил: `keys_watch.samples` —
+  //: сколько раз часовой отработал. При нуле пустая линия НЕ значит
+  //: «ничего не появилось», и читать её как ответ нельзя.
+  var KEYS_WATCH_MS = 50;
+  var KEYS_TIMELINE_CAP = 300;
+  var KEYS_SEEN = {};
+  var KEYS_TIMELINE = [];
+  var KEYS_SAMPLES = 0;
+  var KEYS_BASE_LEN = 0;
+  var KEYS_DROPPED = 0;
+  var KEYS_LAST_MS = null;
+
+  function keysNote(k, t, src, silent) {
+    if (Object.prototype.hasOwnProperty.call(KEYS_SEEN, k)) { return; }
+    KEYS_SEEN[k] = t;
+    if (silent) { KEYS_BASE_LEN += 1; return; }
+    if (KEYS_TIMELINE.length >= KEYS_TIMELINE_CAP) { KEYS_DROPPED += 1; return; }
+    KEYS_TIMELINE.push({k: k, t: t, src: src, sample: KEYS_SAMPLES});
+  }
+
+  function keysScan() {
+    var first = (KEYS_SAMPLES === 0);
+    var t = Math.round(ORIG.now()), k, i;
+    KEYS_SAMPLES += 1;
+    KEYS_LAST_MS = t;
+    for (k in window) { keysNote(k, t, 'enum', first); }
+    for (i = 0; i < DRIVER_NAMES.length; i++) {
+      try {
+        if (DRIVER_NAMES[i] in window) { keysNote(DRIVER_NAMES[i], t, 'name', first); }
+      } catch (e) { /* свойство бросает — это не появление имени */ }
+    }
+  }
+
+  function keysWatch() {
+    return {interval_ms: KEYS_WATCH_MS, samples: KEYS_SAMPLES,
+            base_len: KEYS_BASE_LEN, dropped: KEYS_DROPPED,
+            last_scan_ms: KEYS_LAST_MS,
+            note: 'первый проход — база, в линию не пишется; ' +
+                  'samples=0 значит, что часовой не работал вовсе'};
+  }
+
+  //: Запуск ДО `DOMContentLoaded`: база обязана быть снята раньше, чем
+  //: страница успеет что-нибудь завести сама.
+  keysScan();
+  setInterval(keysScan, KEYS_WATCH_MS);
 
   function dumpA() {
     var hits = {}, name, s;
@@ -317,7 +424,48 @@
       languages: nav.languages ? Array.prototype.slice.call(nav.languages) : null,
       language: nav.language,
       hardware_concurrency: nav.hardwareConcurrency,
+      //: ⚠️⚠️ ТРИДЦАТИ ДВУХ ЗДЕСЬ БЫТЬ НЕ МОЖЕТ (rc97 §5). Device Memory
+      //: API отдаёт значение из набора 0.25/0.5/1/2/4/8 и капит его
+      //: восьмёркой. Значит либо профиль подменил величину — и тогда сайт
+      //: видит РОВНО ТО ЖЕ, что мы, то есть это детекция в одно сравнение,
+      //: либо поле названо неверно и врёт прибор. Различить их чтением
+      //: одного числа нельзя, поэтому рядом стоит проба.
+      //: ⚠️ Само поле НЕ переименовано и читается как читал бы сайт:
+      //: плечо «до» обязано остаться сравнимым с прошлыми дампами.
       device_memory: ('deviceMemory' in nav) ? nav.deviceMemory : null,
+      device_memory_probe: (function () {
+        var SPEC = [0.25, 0.5, 1, 2, 4, 8];
+        var out = {present: ('deviceMemory' in nav), read_by_site: null,
+                   type: null, own_property: null,
+                   proto_descriptor: 'нет', proto_getter_native: null,
+                   via_proto_getter: 'не звали', spec_allowed: null};
+        if (!out.present) { return out; }
+        try {
+          //: То же выражение, что в поле выше: проба обязана начинаться
+          //: с проверки, что поле не врёт само по себе.
+          out.read_by_site = nav.deviceMemory;
+          out.type = typeof nav.deviceMemory;
+          //: Собственное свойство ЭКЗЕМПЛЯРА — почерк слоя подмены;
+          //: у настоящего браузера величина живёт геттером прототипа.
+          out.own_property =
+              Object.prototype.hasOwnProperty.call(nav, 'deviceMemory');
+          var proto = (typeof Navigator === 'function') ? Navigator.prototype : null;
+          var d = proto
+              ? Object.getOwnPropertyDescriptor(proto, 'deviceMemory') : null;
+          if (d) {
+            out.proto_descriptor = d.get ? 'геттер' : 'значение, не геттер';
+            if (d.get) {
+              out.proto_getter_native = isNative(d.get);
+              try { out.via_proto_getter = d.get.call(nav); }
+              catch (e) {
+                out.via_proto_getter = 'бросил: ' + String(e && e.message);
+              }
+            }
+          }
+          out.spec_allowed = SPEC.indexOf(out.read_by_site) >= 0;
+        } catch (e) { out.error = String((e && e.message) || e); }
+        return out;
+      })(),
       max_touch_points: nav.maxTouchPoints,
       platform: nav.platform,
       ua_data: (function () {
@@ -373,6 +521,21 @@
       })(),
       boot_window_keys: BOOT_KEYS,
       window_keys_now: keysOf(window),
+      //: ⚠️⚠️ ВТОРОЙ СПОСОБ ПЕРЕЧИСЛИТЬ (rc101 §1). Пара выше — `for...in`,
+      //: она слепа к неперечислимым именам; пара ниже их видит. Сравнивать
+      //: надо РАЗНОСТЬ с эталоном живого Chrome, а не сами списки:
+      //: `tests/harness/prod_dump_diff.py`.
+      boot_own_names: BOOT_OWN,
+      own_names_now: ownNamesOf(window),
+      boot_document_keys: BOOT_DOC_KEYS,
+      document_keys_now: keysOf(document),
+      boot_document_own_names: BOOT_DOC_OWN,
+      document_own_names_now: ownNamesOf(document),
+      nonenum_probe: nonenumProbe(),
+      //: ⚠️ Линия отвечает на вопрос «когда», которого пара
+      //: boot/now не различает вовсе (rc97 §4).
+      keys_timeline: KEYS_TIMELINE,
+      keys_watch: keysWatch(),
       window_symbols: windowSymbols()
     };
     return out;
@@ -444,6 +607,17 @@
       mouse_holds_ms: [], key_holds_ms: [], key_gaps_ms: [],
       key_overlaps: 0, key_pairs: 0,
       wheel_deltas: {}, wheel_series: [], wheel_ticks: 0,
+      //: ⚠️⚠️ СЧЁТЧИК ПОРЯДКА НЕ ХРАНИТ, а вопрос rc98 §3 именно про порядок:
+      //: человек в каждый момент пользуется ОДНИМ устройством (мышь ИЛИ
+      //: тачпад), а библиотека шлёт щелчок и мелкий докрут — и по агрегату
+      //: `wheel_deltas` не видно, чередуются ли они ВНУТРИ одной серии.
+      //: Поэтому рядом со счётчиком лежит сама последовательность
+      //: `[t, deltaY]` в порядке прихода.
+      //: ⚠️ Границы серий тут НЕ размечаются намеренно: правило то же, что
+      //: у `wheel_series` (пауза > 300 мс), и вторая его копия разъехалась бы
+      //: с первой. Читатель группирует сам по `t`.
+      //: ⚠️ Прибор обязан сказать, что перестал мерить: `wheel_seq_dropped`.
+      wheel_seq: [], wheel_seq_dropped: 0,
       pressure_violation: 0, moves_before_first_press: null,
       untrusted_examples: []
     };
@@ -505,6 +679,9 @@
 
       if (r.type === 'wheel') {
         out.wheel_ticks++;
+        if (out.wheel_seq.length < WHEEL_SEQ_CAP) {
+          out.wheel_seq.push([r.t, r.dy]);
+        } else { out.wheel_seq_dropped++; }
         var key = String(r.dy);
         out.wheel_deltas[key] = (out.wheel_deltas[key] || 0) + 1;
         if (lastWheel !== null && (r.t - lastWheel) > 300) {
@@ -643,6 +820,12 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     BOOT_KEYS = keysOf(window);
+    BOOT_OWN = ownNamesOf(window);
+    BOOT_DOC_KEYS = keysOf(document);
+    BOOT_DOC_OWN = ownNamesOf(document);
+    //: Контроль ставится ПОСЛЕ снимка загрузки — тогда он виден в разнице
+    //: «загрузка → дамп» и заодно показывает, что разность вообще работает.
+    installNonenumProbe();
     var root = document.documentElement;
     var out = document.getElementById('ht_out');
     var i;
@@ -742,7 +925,7 @@
 </div>
 
 <div class="wrap">
-  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc96</span></h1>
+  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc101</span></h1>
   <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
   <code>main_tasks</code> через DOM-мост.</p>
 
