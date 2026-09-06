@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>humanly_testing — прод-детектор (страница page-rc101)</title>
+<title>humanly_testing — прод-детектор (страница page-rc116b)</title>
 
 <!--
   rc93 §2, ред. rc101. ПУБЛИЧНАЯ версия стенда: та же логика, что у
@@ -69,7 +69,22 @@
   //: Кап последовательности тиков. Человеческая сессия дала 818 тиков,
   //: десять повторов библиотеки — порядка двухсот; 2000 покрывает оба
   //: с запасом и стоит ~36 КБ в дампе.
-  var WHEEL_SEQ_CAP = 2000;
+  //: ⚠️⚠️⚠️ ЛИМИТЫ ПОДНЯТЫ ПОД ПАРНЫЙ ПРОГОН (rc116-доп.). Прежние 2000
+  //: были НИЖЕ уже наблюдённых величин: у человека 2571 движение мыши
+  //: в одном сеансе, а тачпадный мах — сотня-другая тиков, то есть фаза
+  //: «30-40 с мышью + 30-40 с тачпадом» переполняла и `move_seq`,
+  //: и `wheel_seq`. Усечение видно по `*_dropped`, но переснять живой
+  //: сеанс на боевом профиле стоит дороже, чем держать запас.
+  var WHEEL_SEQ_CAP = 8000;
+  //: ⚠️⚠️⚠️ rc116 §2: ПОСЛЕДОВАТЕЛЬНОСТИ, А НЕ СВОДКИ. Колесо стоило
+  //: восьми релизов ровно потому, что начиналось с трёх сводных чисел:
+  //: форма, квант, каданс и сегментация были неверны все четыре, и НИ ОДНА
+  //: ошибка не была видна в сводке. Сдвинулось всё только с появлением
+  //: `wheel_seq`. Про мышь мы сегодня знаем два числа (`mouse_hold_p50`,
+  //: `mouse_hold_min`) — та же конструкция, с которой начиналось колесо.
+  var PRESS_SEQ_CAP = 1000;
+  var MOVE_SEQ_CAP = 8000;      //: у человека 2571 движение в ОДНОМ сеансе
+  var KEY_SEQ_CAP = 4000;
   //: Отброшенное считается и попадает в дамп: прибор обязан сказать, что
   //: он перестал мерить, а не тихо отдать усечённую выборку.
   var DROPPED = 0;
@@ -82,7 +97,7 @@
   //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
   //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
   //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
-  var PAGE_BUILD = 'page-rc101';
+  var PAGE_BUILD = 'page-rc116b';
   var LIB_VERSION = null;
 
   // ══════════════════════════════════════════════════════════════════════
@@ -589,6 +604,22 @@
     });
   }
 
+  //: ⚠️⚠️ rc116: класс клавиши ВМЕСТО символа. В дампе не должно быть
+  //: введённого текста, а для удержаний и перекрытий важен именно класс:
+  //: модификатор держат иначе, чем печатный, а backspace приходит очередями.
+  function keyClass(r) {
+    var k = r.key || '', c = r.code || '';
+    if (k === 'Backspace' || k === 'Delete') { return 'b'; }
+    if (k === 'Shift' || k === 'Control' || k === 'Alt' || k === 'Meta' ||
+        k === 'CapsLock') { return 'm'; }
+    if (k.length > 1) {
+      //: Enter/Tab/стрелки/Home/End/PageUp… — навигация и управление.
+      return 'n';
+    }
+    if (c.indexOf('Digit') === 0 || c.indexOf('Numpad') === 0) { return 'p'; }
+    return 'p';
+  }
+
   function q(arr, p) {
     if (!arr.length) { return null; }
     var a = arr.slice().sort(function (x, y) { return x - y; });
@@ -612,16 +643,39 @@
       //: тачпад), а библиотека шлёт щелчок и мелкий докрут — и по агрегату
       //: `wheel_deltas` не видно, чередуются ли они ВНУТРИ одной серии.
       //: Поэтому рядом со счётчиком лежит сама последовательность
-      //: `[t, deltaY]` в порядке прихода.
+      //: `[t, deltaY, ts]` в порядке прихода — ОБА ЧАСА (rc112 §2).
+      //: ⚠️⚠️ `t` это `performance.now()` В МОМЕНТ ОБРАБОТЧИКА (доставка),
+      //: `ts` — `event.timeStamp` (штамп браузера). До rc112 писалось только
+      //: первое, и все кадансовые числа — и человеческие, и наши — были
+      //: про ДОСТАВКУ. Сайт может сравнить пару так же дёшево, как мы,
+      //: поэтому и снимать её надо парой.
       //: ⚠️ Границы серий тут НЕ размечаются намеренно: правило то же, что
       //: у `wheel_series` (пауза > 300 мс), и вторая его копия разъехалась бы
       //: с первой. Читатель группирует сам по `t`.
       //: ⚠️ Прибор обязан сказать, что перестал мерить: `wheel_seq_dropped`.
       wheel_seq: [], wheel_seq_dropped: 0,
+      //: ⚠️ rc116: `[t_down, t_up, x, y, button]` на КАЖДОЕ нажатие.
+      //: Отсюда считается не только удержание, но и то, чего мы не видели
+      //: вовсе: смещение курсора ЗА ВРЕМЯ нажатия (человек ведёт мышь,
+      //: пока кнопка нажата), разброс удержания и его зависимость
+      //: от номера клика. `t_up === null` — нажатие без отпускания,
+      //: это тоже наблюдение, а не мусор.
+      press_seq: [], press_seq_dropped: 0,
+      //: ⚠️ `[t, x, y]` — траектория. Единственный способ увидеть форму
+      //: подхода: кривизну, скорость, дрожание, паузы перед нажатием.
+      move_seq: [], move_seq_dropped: 0,
+      //: ⚠️⚠️ `[t_down, t_up, class]` — БЕЗ САМИХ СИМВОЛОВ: класс это
+      //: `p` печатный / `m` модификатор / `n` навигация / `b` backspace.
+      //: Введённого текста в дампе быть не должно, а удержание, промежуток
+      //: и перекрытие считаются из ОДНОГО массива, а не приходят тремя
+      //: несогласованными сводками (тогда же видно, у каких клавиш
+      //: теряется `keyup` — вопрос rc111 §4).
+      key_seq: [], key_seq_dropped: 0,
       pressure_violation: 0, moves_before_first_press: null,
       untrusted_examples: []
     };
     var downT = {}, keyDownT = {}, lastKeyDown = null, openKey = null;
+    var pressOpen = {}, keySeqOpen = {};
     var lastWheel = null, series = 0;
     var movesBeforeFirstPress = 0, sawFirstPress = false;
 
@@ -637,15 +691,37 @@
 
       if (r.type === 'mousemove' && !sawFirstPress) { movesBeforeFirstPress++; }
 
+      if (r.type === 'mousemove') {
+        if (out.move_seq.length < MOVE_SEQ_CAP) {
+          out.move_seq.push([r.t, r.x, r.y]);
+        } else { out.move_seq_dropped++; }
+      }
+
       if (r.type === 'mousedown') {
         sawFirstPress = true;
         downT[r.id || '_'] = r.ts !== null ? r.ts : r.t;
+        //: Запись заводится на DOWN и дополняется на UP: нажатие без
+        //: отпускания обязано остаться видимым (`t_up === null`).
+        if (out.press_seq.length < PRESS_SEQ_CAP) {
+          out.press_seq.push([r.ts !== null ? r.ts : r.t, null, r.x, r.y,
+                              r.btn]);
+          pressOpen[r.id || '_'] = out.press_seq.length - 1;
+        } else { out.press_seq_dropped++; }
       }
       if (r.type === 'mouseup') {
         var d0 = downT[r.id || '_'];
         if (d0 !== undefined) {
           out.mouse_holds_ms.push(Math.round(((r.ts !== null ? r.ts : r.t) - d0) * 10) / 10);
           delete downT[r.id || '_'];
+        }
+        var pi = pressOpen[r.id || '_'];
+        if (pi !== undefined && out.press_seq[pi]) {
+          out.press_seq[pi][1] = r.ts !== null ? r.ts : r.t;
+          //: Координаты ОТПУСКАНИЯ дописываются отдельными полями, чтобы
+          //: смещение за время нажатия считалось без второй записи.
+          out.press_seq[pi][5] = r.x;
+          out.press_seq[pi][6] = r.y;
+          delete pressOpen[r.id || '_'];
         }
       }
       if (r.type === 'pointerdown' && r.pres === 0 && r.btn === 1) {
@@ -666,6 +742,10 @@
         lastKeyDown = kt;
         keyDownT[r.key] = kt;
         openKey = r.key;
+        if (out.key_seq.length < KEY_SEQ_CAP) {
+          out.key_seq.push([kt, null, keyClass(r)]);
+          keySeqOpen[r.key] = out.key_seq.length - 1;
+        } else { out.key_seq_dropped++; }
       }
       if (r.type === 'keyup') {
         var k0 = keyDownT[r.key];
@@ -675,12 +755,17 @@
           delete keyDownT[r.key];
           if (openKey === r.key) { openKey = null; }
         }
+        var ki = keySeqOpen[r.key];
+        if (ki !== undefined && out.key_seq[ki]) {
+          out.key_seq[ki][1] = r.ts !== null ? r.ts : r.t;
+          delete keySeqOpen[r.key];
+        }
       }
 
       if (r.type === 'wheel') {
         out.wheel_ticks++;
         if (out.wheel_seq.length < WHEEL_SEQ_CAP) {
-          out.wheel_seq.push([r.t, r.dy]);
+          out.wheel_seq.push([r.t, r.dy, r.ts]);
         } else { out.wheel_seq_dropped++; }
         var key = String(r.dy);
         out.wheel_deltas[key] = (out.wheel_deltas[key] || 0) + 1;
@@ -693,6 +778,81 @@
       }
     }
     if (series) { out.wheel_series.push(series); }
+
+    //: ⚠️⚠️⚠️ rc114 §3: ВМЕНЯЕМОСТЬ ШТАМПА проверяет ПРИБОР, а не читатель
+    //: отчёта. Повод — находка rc113: `timestamp` у CDP это СЕКУНДЫ ОТ
+    //: ЭПОХИ, и `performance.now()/1000` кладёт на страницу
+    //: `event.timeStamp = 0` КАЖДОМУ событию, при этом прогон выглядит
+    //: здоровым: события идут, скролл происходит, отчёт печатается.
+    //: Категорическая подпись, получаемая ПО НЕОСТОРОЖНОСТИ, — а запись
+    //: в CLAUDE.md в три часа ночи не срабатывает.
+    //: Четыре нарушения, которых у живого устройства не бывает:
+    //:   zero          — штамп ровно 0 (или отрицательный);
+    //:   future        — штамп ПОЗЖЕ момента обработки (ts > t);
+    //:   non_monotonic — штамп меньше предыдущего;
+    //:   denser        — зазор штампов ПЛОТНЕЕ периода устройства.
+    //: ⚠️ «Ровные штампы при рваной обработке» нарушением НЕ являются:
+    //: именно так выглядит человек на загруженной машине (rc113 §2).
+    var TS_PERIOD_MS = 7.0;
+    //: ⚠️⚠️⚠️ ПОРОГ 0.7 ПЕРИОДА, А НЕ ПЕРИОД (rc116-доп.5). Строгое
+    //: «меньше периода» разрезает САМЫЙ ПЛОТНЫЙ ПИК распределения: у человека
+    //: пик зазоров стоит на 6.9…7.1 мс, и порог 7.0 объявил бы нарушением
+    //: половину обычных пар — на тачпаде 49 %. Результат стал бы функцией
+    //: округления, а не поведения, и следующей правкой мы бы ДОБАВЛЯЛИ себе
+    //: пары плотнее периода, гоняясь за артефактом определения.
+    //: Порог обязан стоять в РАЗРЕЖЕНИИ: у тачпада доля одинакова (1.4 %)
+    //: и при 0.5 P, и при 0.8 P, то есть в этом промежутке порог ни на что
+    //: не влияет; 0.7 P попадает в него и у мыши (разрежение 4.4…5.2).
+    var TS_DENSER_FACTOR = 0.7;
+    var sanity = {checked: 0, zero: 0, future: 0, non_monotonic: 0,
+                  denser: 0, examples: []};
+    //: ⚠️⚠️ Монотонность считается ВНУТРИ ПОТОКА ОДНОГО ТИПА, а не по всей
+    //: записи: первая редакция сравнивала подряд идущие события РАЗНЫХ типов
+    //: (`scroll` после `wheel`) и давала 16 ложных нарушений на честном
+    //: плече. Порядок между разными потоками — свойство очереди задач,
+    //: а не штампа; поймано положительным контролем, а не рассуждением.
+    var prevByType = {};
+    for (var si = 0; si < REC.length; si++) {
+      var e = REC[si];
+      if (e.ts === null || e.ts === undefined) { continue; }
+      sanity.checked++;
+      var prevTs = prevByType[e.type];
+      var bad = null;
+      if (e.ts <= 0) { sanity.zero++; bad = 'zero'; }
+      else if (e.t !== null && e.t !== undefined && e.ts > e.t + 1.0) {
+        sanity.future++; bad = 'future';
+      } else if (prevTs !== undefined && e.ts < prevTs) {
+        sanity.non_monotonic++; bad = 'non_monotonic';
+      } else if (prevTs !== undefined && e.type === 'wheel' &&
+                 (e.ts - prevTs) > 0 &&
+                 (e.ts - prevTs) < TS_PERIOD_MS * TS_DENSER_FACTOR) {
+        sanity.denser++; bad = 'denser';
+      }
+      if (bad && sanity.examples.length < 5) {
+        sanity.examples.push({why: bad, type: e.type,
+                              ts: Math.round(e.ts * 100) / 100,
+                              t: Math.round(e.t * 100) / 100});
+      }
+      prevByType[e.type] = e.ts;
+    }
+    //: ⚠️ Правило rc71 §3: прибор обязан утверждать, что он ЧТО-ТО измерил.
+    //: `checked = 0` это не «нарушений нет», а «штампов не видел вовсе».
+    sanity.verdict = (sanity.checked === 0) ? 'НЕ ПРОВЕРЕНО: штампов нет'
+        : (sanity.zero + sanity.future + sanity.non_monotonic + sanity.denser)
+            ? 'НАРУШЕНИЯ ЕСТЬ' : 'чисто';
+    out.ts_sanity = sanity;
+
+    //: ⚠️⚠️ УСЕЧЕНИЕ ОБЯЗАНО БЫТЬ ЗАМЕТНЫМ, а не лежать в четырёх счётчиках,
+    //: которые никто не сложит. Обрезанная последовательность — это НЕ
+    //: «данных меньше», а другая форма распределения: у неё срезан хвост
+    //: ровно там, где человек делал дольше всего.
+    var trunc = [];
+    if (out.wheel_seq_dropped) { trunc.push('wheel_seq:' + out.wheel_seq_dropped); }
+    if (out.move_seq_dropped) { trunc.push('move_seq:' + out.move_seq_dropped); }
+    if (out.press_seq_dropped) { trunc.push('press_seq:' + out.press_seq_dropped); }
+    if (out.key_seq_dropped) { trunc.push('key_seq:' + out.key_seq_dropped); }
+    if (DROPPED) { trunc.push('events:' + DROPPED); }
+    out.seq_truncated = trunc.length ? trunc.join(', ') : null;
     //: ⚠️⚠️ ИМЯ ПЕРЕИМЕНОВАНО (rc96 §5): считалось всегда одно — сколько
     //: `mousemove` пришло ДО ПЕРВОГО `mousedown` документа. Прежнее
     //: `press_without_move` читалось как «нажатий без движения», и число
@@ -925,7 +1085,7 @@
 </div>
 
 <div class="wrap">
-  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc101</span></h1>
+  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc116b</span></h1>
   <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
   <code>main_tasks</code> через DOM-мост.</p>
 
