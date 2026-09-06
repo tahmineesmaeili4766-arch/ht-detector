@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>humanly_testing — прод-детектор (страница page-rc116b)</title>
+<title>humanly_testing — прод-детектор (страница page-rc117)</title>
 
 <!--
   rc93 §2, ред. rc101. ПУБЛИЧНАЯ версия стенда: та же логика, что у
@@ -75,7 +75,45 @@
   //: «30-40 с мышью + 30-40 с тачпадом» переполняла и `move_seq`,
   //: и `wheel_seq`. Усечение видно по `*_dropped`, но переснять живой
   //: сеанс на боевом профиле стоит дороже, чем держать запас.
-  var WHEEL_SEQ_CAP = 8000;
+  //: ⚠️⚠️⚠️ БЮДЖЕТ ТЕПЕРЬ У КАЖДОГО КАНАЛА СВОЙ (rc117 §7), И ЭТО НЕ ТО ЖЕ
+  //: САМОЕ, ЧТО КАПЫ ПОСЛЕДОВАТЕЛЬНОСТЕЙ НИЖЕ. Персональные капы
+  //: `*_SEQ_CAP` существовали и раньше, но они стоят ПОСЛЕ журнала:
+  //: в `REC` событие не попадало вовсе, если журнал уже полон, — а лимит
+  //: на журнал был ОДИН на всех. Обильный канал морил остальные голодом.
+  //: Замер парного прогона: владелец прокрутил 11 823 тика (`scroll` идёт
+  //: с колесом один к одному), общий кап 40 000 выбрался ВО ВРЕМЯ
+  //: прокрутки, и нажатия с клавишами, которые он делал ПОСЛЕ неё,
+  //: не записались НИ ОДНОГО. `press_seq` и `key_seq` фазы A пусты —
+  //: четыре вопроса из восьми остались без данных, и по строке
+  //: `events:25522` этого не видно.
+  //: ⚠️ Капы обильных каналов ≥ капов их последовательностей, поэтому
+  //: усечение решается в ОДНОМ месте — на входе в журнал; `*_seq_dropped`
+  //: остаются вторым рубежом на случай, если кто-то поднимет один кап,
+  //: забыв про другой.
+  var CH_CAP = {wheel: 20000, scroll: 10000, move: 14000,
+                key: 8000, press: 4000, other: 4000};
+  var CH_N = {}, CH_DROPPED = {};
+  //: ⚠️⚠️ ЗАКРЫВАЮЩЕЕ СОБЫТИЕ ПРОХОДИТ МИМО КАПА, если открывающее записано.
+  //: Иначе усечение САМО ПРОИЗВОДИТ наблюдаемую: запись с `t_up === null`
+  //: читается разбором как «потерян keyup», а это отдельный вопрос прогона
+  //: (у человека теряются модификаторы, а не печатные). Число таких
+  //: пропусков ограничено числом открытых нажатий, то есть мало.
+  var OPEN_KEYS = {}, OPEN_BTNS = 0;
+  function chan(type) {
+    if (type === 'wheel') { return 'wheel'; }
+    if (type === 'scroll') { return 'scroll'; }
+    if (type === 'mousemove' || type === 'pointermove') { return 'move'; }
+    if (type.indexOf('key') === 0) { return 'key'; }
+    if (type === 'input' || type === 'change' ||
+        type === 'focus' || type === 'blur') { return 'other'; }
+    return 'press';
+  }
+
+  //: ⚠️ Кап поднят до бюджета своего канала: у владельца было 11 823 тика,
+  //: прежние 8000 обрезали бы `wheel_seq` и разбор ОТКАЗАЛСЯ БЫ считать
+  //: годный сеанс. Тот же дефект, что нашла предполётная проверка
+  //: rc116-доп., — лимит ниже уже наблюдённой величины.
+  var WHEEL_SEQ_CAP = 20000;
   //: ⚠️⚠️⚠️ rc116 §2: ПОСЛЕДОВАТЕЛЬНОСТИ, А НЕ СВОДКИ. Колесо стоило
   //: восьми релизов ровно потому, что начиналось с трёх сводных чисел:
   //: форма, квант, каданс и сегментация были неверны все четыре, и НИ ОДНА
@@ -83,7 +121,7 @@
   //: `wheel_seq`. Про мышь мы сегодня знаем два числа (`mouse_hold_p50`,
   //: `mouse_hold_min`) — та же конструкция, с которой начиналось колесо.
   var PRESS_SEQ_CAP = 1000;
-  var MOVE_SEQ_CAP = 8000;      //: у человека 2571 движение в ОДНОМ сеансе
+  var MOVE_SEQ_CAP = 14000;     //: у человека 4901 движение в ОДНОМ сеансе
   var KEY_SEQ_CAP = 4000;
   //: Отброшенное считается и попадает в дамп: прибор обязан сказать, что
   //: он перестал мерить, а не тихо отдать усечённую выборку.
@@ -97,7 +135,7 @@
   //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
   //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
   //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
-  var PAGE_BUILD = 'page-rc116b';
+  var PAGE_BUILD = 'page-rc117';
   var LIB_VERSION = null;
 
   // ══════════════════════════════════════════════════════════════════════
@@ -574,7 +612,23 @@
   }
 
   function on(e) {
-    if (REC.length >= CAP) { DROPPED += 1; return; }
+    //: ⚠️⚠️⚠️ ВОРОТА ПОКАНАЛЬНЫЕ (rc117 §7). Переполнение одного канала
+    //: на другие не влияет: вопросы про нажатия и клавиши не должны
+    //: зависеть от того, сколько человек прокрутил.
+    var ch = chan(e.type), forced = false;
+    if (e.type === 'keyup') {
+      if (OPEN_KEYS[e.key]) { forced = true; delete OPEN_KEYS[e.key]; }
+    } else if (e.type === 'mouseup' || e.type === 'pointerup') {
+      if (OPEN_BTNS > 0) { forced = true; OPEN_BTNS -= 1; }
+    }
+    if (!forced && (CH_N[ch] || 0) >= CH_CAP[ch]) {
+      CH_DROPPED[ch] = (CH_DROPPED[ch] || 0) + 1;
+      DROPPED += 1;
+      return;
+    }
+    CH_N[ch] = (CH_N[ch] || 0) + 1;
+    if (e.type === 'keydown' && e.repeat !== true) { OPEN_KEYS[e.key] = true; }
+    if (e.type === 'mousedown' || e.type === 'pointerdown') { OPEN_BTNS += 1; }
     REC.push({
       t: Math.round(ORIG.now() * 10) / 10,
       ts: (typeof e.timeStamp === 'number')
@@ -851,8 +905,42 @@
     if (out.move_seq_dropped) { trunc.push('move_seq:' + out.move_seq_dropped); }
     if (out.press_seq_dropped) { trunc.push('press_seq:' + out.press_seq_dropped); }
     if (out.key_seq_dropped) { trunc.push('key_seq:' + out.key_seq_dropped); }
-    if (DROPPED) { trunc.push('events:' + DROPPED); }
+    if (DROPPED) {
+      var chParts = [];
+      for (var chName in CH_DROPPED) {
+        if (CH_DROPPED[chName]) { chParts.push(chName + ':' + CH_DROPPED[chName]); }
+      }
+      trunc.push('events:' + DROPPED + ' (' + chParts.join(' ') + ')');
+    }
+    //: ⚠️⚠️ КАНАЛ, ПОТЕРЯННЫЙ ЦЕЛИКОМ, НАЗЫВАЕТСЯ ОТДЕЛЬНОЙ СТРОКОЙ, а не
+    //: вычисляется читателем из счётчиков. В парном прогоне `press_seq`
+    //: и `key_seq` фазы A были ПУСТЫ, и по строке `events:25522` этого
+    //: было не видно: «данных меньше» и «данных нет вовсе» — разные
+    //: сообщения, и второе обязано звучать вслух (rc71 §3).
+    var lostAll = [];
+    if (!out.wheel_seq.length && (CH_DROPPED.wheel || out.wheel_seq_dropped)) {
+      lostAll.push('wheel_seq');
+    }
+    if (!out.move_seq.length && (CH_DROPPED.move || out.move_seq_dropped)) {
+      lostAll.push('move_seq');
+    }
+    if (!out.press_seq.length && (CH_DROPPED.press || out.press_seq_dropped)) {
+      lostAll.push('press_seq');
+    }
+    if (!out.key_seq.length && (CH_DROPPED.key || out.key_seq_dropped)) {
+      lostAll.push('key_seq');
+    }
+    if (lostAll.length) {
+      trunc.push('ПОТЕРЯНО ПОЛНОСТЬЮ: ' + lostAll.join(', '));
+    }
     out.seq_truncated = trunc.length ? trunc.join(', ') : null;
+    //: Сколько записано и сколько отброшено ПО КАЖДОМУ каналу — рядом
+    //: с вердиктом, чтобы поднимать нужный кап, а не все шесть.
+    out.channels = {};
+    for (var cn in CH_CAP) {
+      out.channels[cn] = {n: CH_N[cn] || 0, dropped: CH_DROPPED[cn] || 0,
+                          cap: CH_CAP[cn]};
+    }
     //: ⚠️⚠️ ИМЯ ПЕРЕИМЕНОВАНО (rc96 §5): считалось всегда одно — сколько
     //: `mousemove` пришло ДО ПЕРВОГО `mousedown` документа. Прежнее
     //: `press_without_move` читалось как «нажатий без движения», и число
@@ -965,6 +1053,18 @@
   window.__ht_detector = {dump: dumpAll, dumpA: dumpA, dumpB: dumpB,
                           stats: stats, selftest: selftest, rearm: rearm,
                           note: noteDump,
+                          //: ⚠️ Тот же источник, что у блока `channels`
+                          //: в дампе: строка на экране и число в файле
+                          //: обязаны быть ОДНОЙ величиной.
+                          channels: function () {
+                            var o = {};
+                            for (var cn in CH_CAP) {
+                              o[cn] = {n: CH_N[cn] || 0,
+                                       dropped: CH_DROPPED[cn] || 0,
+                                       cap: CH_CAP[cn]};
+                            }
+                            return o;
+                          },
                           raw: function () { return REC; }};
 
   // ══════════════════════════════════════════════════════════════════════
@@ -1019,6 +1119,10 @@
         else if (cmd === 'rearm') { setOut(out, rearm() ? '1' : '0'); }
         else if (cmd === 'reset') {
           H = {}; REC.length = 0; DROPPED = 0; REPEATS_SEEN = 0;
+          //: ⚠️ Счётчики каналов и незакрытые нажатия сбрасываются ВМЕСТЕ
+          //: с журналом: пережившее сброс `CH_N` молча урезало бы
+          //: следующий прогон.
+          CH_N = {}; CH_DROPPED = {}; OPEN_KEYS = {}; OPEN_BTNS = 0;
           setOut(out, '1');
         }
         else if (cmd === 'selftest') { setOut(out, selftest() ? '1' : '0'); }
@@ -1085,7 +1189,7 @@
 </div>
 
 <div class="wrap">
-  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc116b</span></h1>
+  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc117</span></h1>
   <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
   <code>main_tasks</code> через DOM-мост.</p>
 
@@ -1145,6 +1249,11 @@
       <button class="ui" id="btn-reset" type="button">Сбросить журнал</button>
       <span class="muted">снято дампов: <span id="dump-count">0</span></span>
     </p>
+    <!-- ⚠️⚠️ ЖУРНАЛ ВИДЕН ДО СНЯТИЯ ДАМПА (rc117 §7). Владелец жмёт кнопку
+         в конце сеанса, и до этой строки узнать о переполнении было
+         неоткуда: переполнение обнаруживалось при РАЗБОРЕ, когда сеанс
+         уже не переснять. Канал, выбравший бюджет, красится. -->
+    <p class="muted" id="ch-counters">журнал: —</p>
     <!-- ⚠️ Узлы ниже существуют ради каскада библиотеки, а не ради красоты:
          клик по «Снять дамп» обязан оставить след В ДЕРЕВЕ (rc96 §4.1). -->
     <div id="dump-log"></div>
@@ -1202,6 +1311,29 @@
   document.getElementById('btn-reset').addEventListener('click', function () {
     document.documentElement.setAttribute('data-ht-cmd', 'reset');
   });
+
+  //: ⚠️⚠️ Счётчики читаются ЧЕРЕЗ СОБСТВЕННЫЙ ВЫХОД прибора
+  //: (`window.__ht_detector.channels()`), а не из замыкания напрямую:
+  //: строка на экране обязана показывать ровно то, что попадёт в дамп,
+  //: иначе это второй прибор со своей правдой.
+  //: ⚠️ Обновление по таймеру, а НЕ на каждом событии: слушатель, растущий
+  //: линейно с журналом, сам стал бы нагрузкой в фазе про каданс.
+  (function () {
+    var box = document.getElementById('ch-counters');
+    if (!box || !window.__ht_detector || !window.__ht_detector.channels) { return; }
+    setInterval(function () {
+      var ch = window.__ht_detector.channels(), parts = [], full = false;
+      for (var k in ch) {
+        var c = ch[k];
+        if (c.dropped) { full = true; }
+        parts.push(k + ' ' + c.n + '/' + c.cap + (c.dropped ? ' ⛔+' + c.dropped : ''));
+      }
+      box.textContent = 'журнал: ' + parts.join(' · ') +
+          (full ? '  ⛔ ЕСТЬ ПЕРЕПОЛНЕНИЕ — числа по этому каналу неполны'
+                : '');
+      box.style.color = full ? '#b00' : '';
+    }, 1000);
+  })();
 })();
 </script>
 </body>
