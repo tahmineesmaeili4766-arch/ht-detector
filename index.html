@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>humanly_testing — прод-детектор (страница page-rc117)</title>
+<title>humanly_testing — прод-детектор (страница page-rc119)</title>
 
 <!--
   rc93 §2, ред. rc101. ПУБЛИЧНАЯ версия стенда: та же логика, что у
@@ -135,8 +135,15 @@
   //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
   //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
   //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
-  var PAGE_BUILD = 'page-rc117';
+  var PAGE_BUILD = 'page-rc119';
   var LIB_VERSION = null;
+  //: ⚠️⚠️⚠️ ЧТО РАЗЫГРАНО В СЕССИИ (rc118 §3). Устройство прокрутки
+  //: и темперамент разыгрываются ОДИН РАЗ на сессию и меняют наблюдаемое
+  //: сильнее любого параметра: две сессии одного дерева дали 2.6 % и 84 %
+  //: зазоров в один период, и отличить «другое устройство» от «другая
+  //: сборка» было НЕЧЕМ. Приходит одной командой `session=<json>` вместе
+  //: с версией — той же, которой раньше слали только `lib=`.
+  var SESSION_INFO = null;
 
   // ══════════════════════════════════════════════════════════════════════
   //  Часть A: НАШ след — какие API страница видит от кода библиотеки
@@ -266,6 +273,67 @@
   //: и ОБЯЗАНО отсутствовать в `keys`. Без него «в own_names ничего
   //: лишнего» неотличимо от «own_names не работает», а это ровно та
   //: слепота, ради которой раздел и заведён.
+  //: ⚠️⚠️⚠️ ПОВЕРХНОСТИ, ОБЕЩАННЫЕ В rc108 §3.2 (сделано в rc119).
+  //: Раздел утечек до сих пор смотрел ТОЛЬКО на `window` и `document`.
+  //: Детектор спрашивает и `navigator`, и прототипы событий: подменённый
+  //: `MouseEvent.prototype` читается ОДНОЙ строкой, а у нас про него
+  //: не было ни снимка, ни разности.
+  //: ⚠️ Формат тот же, что у `window`: собственные имена + дескрипторы,
+  //: снимок НА ЗАГРУЗКЕ и НА ДАМПЕ. Вердикт даёт РАЗНОСТЬ.
+  var SURFACES = [
+    //: ⚠️⚠️ У `navigator`/`screen`/`location` СОБСТВЕННЫХ имён нет —
+    //: всё лежит на ПРОТОТИПЕ. Первая редакция снимала только
+    //: экземпляры и давала 0 имён: плечо, не способное дать не-ноль,
+    //: не утверждает ничего (rc71 §3). Снимаем и то, и другое.
+    ['navigator', function () { return navigator; }],
+    ['Navigator.prototype', function () { return Navigator.prototype; }],
+    ['screen', function () { return screen; }],
+    ['Screen.prototype', function () { return Screen.prototype; }],
+    ['location', function () { return location; }],
+    ['Location.prototype', function () { return Location.prototype; }],
+    ['MouseEvent.prototype', function () { return MouseEvent.prototype; }],
+    ['KeyboardEvent.prototype', function () { return KeyboardEvent.prototype; }],
+    ['WheelEvent.prototype', function () { return WheelEvent.prototype; }],
+    ['EventTarget.prototype', function () { return EventTarget.prototype; }],
+    ['Element.prototype', function () { return Element.prototype; }],
+    ['Document.prototype', function () { return Document.prototype; }],
+    ['Function.prototype', function () { return Function.prototype; }]
+  ];
+  var NATIVE_RE = new RegExp('\{\s*\[native code\]\s*\}');
+  var FN_TO_STRING = Function.prototype.toString;
+
+  function descOf(obj, name) {
+    try {
+      var d = Object.getOwnPropertyDescriptor(obj, name);
+      if (!d) { return null; }
+      var kind = (d.get || d.set) ? 'accessor' : (typeof d.value);
+      var native = null;
+      var fn = d.get || (typeof d.value === 'function' ? d.value : null);
+      if (fn) {
+        try { native = NATIVE_RE.test(FN_TO_STRING.call(fn)); }
+        catch (e) { native = null; }
+      }
+      return {k: kind, e: !!d.enumerable, c: !!d.configurable,
+              w: d.writable === undefined ? null : !!d.writable, n: native};
+    } catch (e) { return null; }
+  }
+
+  function surfaceSnapshot() {
+    var out = {}, i, name, obj, names, j, descs;
+    for (i = 0; i < SURFACES.length; i++) {
+      name = SURFACES[i][0];
+      try { obj = SURFACES[i][1](); }
+      catch (e) { out[name] = {error: String(e)}; continue; }
+      names = ownNamesOf(obj);
+      descs = {};
+      if (names) {
+        for (j = 0; j < names.length; j++) { descs[names[j]] = descOf(obj, names[j]); }
+      }
+      out[name] = {own_names: names, descriptors: descs};
+    }
+    return out;
+  }
+
   var NONENUM_PROBE = '__ht_nonenum_probe_v1';
   function installNonenumProbe() {
     try {
@@ -302,6 +370,7 @@
   //: Те же снимки вторым способом. Снимаются В ТОТ ЖЕ МОМЕНТ, иначе
   //: разность двух списков окажется разностью двух моментов.
   var BOOT_OWN = null;
+  var BOOT_SURFACES = null;
   var BOOT_DOC_KEYS = null;
   var BOOT_DOC_OWN = null;
 
@@ -589,7 +658,9 @@
       //: boot/now не различает вовсе (rc97 §4).
       keys_timeline: KEYS_TIMELINE,
       keys_watch: keysWatch(),
-      window_symbols: windowSymbols()
+      window_symbols: windowSymbols(),
+      boot_surfaces: BOOT_SURFACES,
+      surfaces_now: surfaceSnapshot()
     };
     return out;
   }
@@ -1040,7 +1111,8 @@
   }
 
   function dumpAll() {
-    return {page_build: PAGE_BUILD, lib_version: LIB_VERSION, mode: MODE,
+    return {page_build: PAGE_BUILD, lib_version: LIB_VERSION,
+            session: SESSION_INFO, mode: MODE,
             repeat_hint: REPEATS_SEEN, taken_at_ms: Math.round(ORIG.now()),
             page: {scrollY: Math.round(window.scrollY),
                    inner: {w: window.innerWidth, h: window.innerHeight},
@@ -1083,6 +1155,7 @@
     BOOT_OWN = ownNamesOf(window);
     BOOT_DOC_KEYS = keysOf(document);
     BOOT_DOC_OWN = ownNamesOf(document);
+    BOOT_SURFACES = surfaceSnapshot();
     //: Контроль ставится ПОСЛЕ снимка загрузки — тогда он виден в разнице
     //: «загрузка → дамп» и заодно показывает, что разность вообще работает.
     installNonenumProbe();
@@ -1116,6 +1189,22 @@
           LIB_VERSION = cmd.slice(4);
           setOut(out, LIB_VERSION);
         }
+        //: ⚠️ `session=` НЕ заменяет `lib=`, а включает её в себя: если
+        //: в объекте есть `lib_version`, он же проставляется отдельным
+        //: полем. Одна команда вместо двух — потому что забыть одну
+        //: из двух ровно так и вышло в парном прогоне.
+        else if (cmd.indexOf('session=') === 0) {
+          try {
+            SESSION_INFO = JSON.parse(cmd.slice(8));
+            if (SESSION_INFO && SESSION_INFO.lib_version) {
+              LIB_VERSION = SESSION_INFO.lib_version;
+            }
+            setOut(out, '1');
+          } catch (e) {
+            SESSION_INFO = {parse_error: String(e), raw: cmd.slice(8, 200)};
+            setOut(out, 'error');
+          }
+        }
         else if (cmd === 'rearm') { setOut(out, rearm() ? '1' : '0'); }
         else if (cmd === 'reset') {
           H = {}; REC.length = 0; DROPPED = 0; REPEATS_SEEN = 0;
@@ -1123,6 +1212,8 @@
           //: с журналом: пережившее сброс `CH_N` молча урезало бы
           //: следующий прогон.
           CH_N = {}; CH_DROPPED = {}; OPEN_KEYS = {}; OPEN_BTNS = 0;
+          //: ⚠️ `SESSION_INFO` и `LIB_VERSION` сброс ПЕРЕЖИВАЮТ:
+          //: сессия та же, а кнопка сброса чистит журнал, а не персону.
           setOut(out, '1');
         }
         else if (cmd === 'selftest') { setOut(out, selftest() ? '1' : '0'); }
@@ -1189,7 +1280,7 @@
 </div>
 
 <div class="wrap">
-  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc117</span></h1>
+  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc119</span></h1>
   <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
   <code>main_tasks</code> через DOM-мост.</p>
 
@@ -1256,6 +1347,31 @@
     <p class="muted" id="ch-counters">журнал: —</p>
     <!-- ⚠️ Узлы ниже существуют ради каскада библиотеки, а не ради красоты:
          клик по «Снять дамп» обязан оставить след В ДЕРЕВЕ (rc96 §4.1). -->
+    <!-- ⚠️ rc119 замер 5: нативный <select> и кастомный список. Нужны,
+         чтобы подсистема `select` вообще была ИСПОЛНИМА на этой странице:
+         без них замер вернул бы ноль, означающий «нечего было выбирать»,
+         а не «аномалий нет». -->
+    <p>
+      <label>Штат:
+        <select id="state-native">
+          <option value="">—</option>
+          <option value="CA">California</option>
+          <option value="NY">New York</option>
+          <option value="TX">Texas</option>
+        </select>
+      </label>
+    </p>
+    <p>
+      <span id="custom-select" role="combobox" aria-expanded="false"
+            tabindex="0" style="display:inline-block;border:1px solid #999;
+            padding:4px 10px;cursor:pointer;min-width:140px">выберите…</span>
+      <span id="custom-list" role="listbox" hidden
+            style="display:none;border:1px solid #999;background:#fff">
+        <span role="option" data-v="CA" style="display:block;padding:4px 10px">California</span>
+        <span role="option" data-v="NY" style="display:block;padding:4px 10px">New York</span>
+        <span role="option" data-v="TX" style="display:block;padding:4px 10px">Texas</span>
+      </span>
+    </p>
     <div id="dump-log"></div>
     <textarea id="ht_out" spellcheck="false"></textarea>
   </div>
@@ -1308,6 +1424,33 @@
     //: и заканчивался `ActionFailed`: каскаду нечего было увидеть.
     window.__ht_detector.note(payload.length);
   });
+  //: rc119: минимальный кастомный список — открыть/выбрать, как на сайтах.
+  (function () {
+    var box = document.getElementById('custom-select');
+    var list = document.getElementById('custom-list');
+    if (!box || !list) { return; }
+    box.addEventListener('click', function () {
+      var open = list.hasAttribute('hidden');
+      if (open) { list.removeAttribute('hidden'); list.style.display = 'inline-block'; }
+      else { list.setAttribute('hidden', ''); list.style.display = 'none'; }
+      box.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    list.addEventListener('click', function (e) {
+      var t = e.target;
+      if (t && t.getAttribute('role') === 'option') {
+        box.textContent = t.textContent;
+        list.setAttribute('hidden', ''); list.style.display = 'none';
+        box.setAttribute('aria-expanded', 'false');
+      }
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        list.setAttribute('hidden', ''); list.style.display = 'none';
+        box.setAttribute('aria-expanded', 'false');
+      }
+    });
+  })();
+
   document.getElementById('btn-reset').addEventListener('click', function () {
     document.documentElement.setAttribute('data-ht-cmd', 'reset');
   });
