@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>humanly_testing — прод-детектор (страница page-rc119)</title>
+<title>humanly_testing — прод-детектор</title>
 
 <!--
   rc93 §2, ред. rc101. ПУБЛИЧНАЯ версия стенда: та же логика, что у
@@ -135,7 +135,7 @@
   //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
   //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
   //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
-  var PAGE_BUILD = 'page-rc124b';
+  var PAGE_BUILD = 'page-rc124c';
   //: ⚠️⚠️ ВЕРСИЯ БИБЛИОТЕКИ — ВТОРОЙ ВХОД, `?lib=` В АДРЕСЕ (rc124-доп.).
   //: Команда моста `lib=` остаётся и побеждает; параметр нужен там, где
   //: моста нет вовсе: плечо приёмки открывает страницу ОДНИМ `goto`,
@@ -1811,10 +1811,37 @@
             A: dumpA(), B: dumpB(), C: stats(), D: dumpD()};
   }
 
+  //: ⚠️⚠️⚠️ ВЕРСИЯ СТРАНИЦЫ ЖИВЁТ В ОДНОМ МЕСТЕ, И ЭТО НЕ АККУРАТНОСТЬ
+  //: (rc124-доп.). Она была записана ТРИЖДЫ — `PAGE_BUILD`, `<title>`
+  //: и `<h1>` — и два литерала отстали на пять сборок: страница называла
+  //: себя `page-rc119`, имея на борту всё из rc124. Дамп при этом нёс
+  //: верное `page_build`, то есть разбор молчал, а человек читал экран
+  //: и видел другое. **Литерал версии в разметке запрещён: и заголовок,
+  //: и подпись строятся отсюда.**
+  //: ⚠️ Заголовок ставится СРАЗУ (элемент `<title>` уже разобран), подпись
+  //: в `<h1>` — на `DOMContentLoaded`: этот скрипт первый в документе,
+  //: и тела ещё нет.
+  document.title = 'humanly_testing — прод-детектор (страница '
+                   + PAGE_BUILD + ')';
+  document.addEventListener('DOMContentLoaded', function () {
+    var el = document.getElementById('page-build');
+    if (el) { el.textContent = 'страница ' + PAGE_BUILD; }
+  });
+
   window.__ht_detector = {dump: dumpAll, dumpA: dumpA, dumpB: dumpB,
                           dumpD: dumpD,
                           stats: stats, selftest: selftest, rearm: rearm,
                           note: noteDump,
+                          //: ⚠️⚠️⚠️ ОТМЕТКА ЧЕЛОВЕКА ЭКСПОРТИРУЕТСЯ, ИНАЧЕ
+                          //: КНОПКИ НЕ БУДЕТ ВОВСЕ. Разметка и обработчики
+                          //: живут во ВТОРОМ скрипте, за границей этого
+                          //: замыкания: прямой вызов `focusHumanMark()`
+                          //: оттуда — `ReferenceError` на каждое нажатие.
+                          //: Поймано на разборе третьего места версии;
+                          //: самопроверка этого не видела, потому что
+                          //: ходила командой моста, а не КНОПКОЙ.
+                          mark: focusHumanMark,
+                          marks: function () { return FOCUS_MARKS.length; },
                           //: ⚠️ Тот же источник, что у блока `channels`
                           //: в дампе: строка на экране и число в файле
                           //: обязаны быть ОДНОЙ величиной.
@@ -1977,7 +2004,7 @@
 </div>
 
 <div class="wrap">
-  <h1>humanly_testing — прод-детектор <span class="muted">страница page-rc119</span></h1>
+  <h1>humanly_testing — прод-детектор <span class="muted" id="page-build"></span></h1>
   <p class="sub">Страница ничего никуда не отправляет. Результат забирает ваш
   <code>main_tasks</code> через DOM-мост.</p>
 
@@ -2121,10 +2148,13 @@
   (function () {
     var btn = document.getElementById('btn-mark');
     function doMark() {
-      var label = focusHumanMark();
+      //: ⚠️⚠️ ЧЕРЕЗ ЭКСПОРТ, а не напрямую: этот скрипт — ВТОРОЙ в
+      //: документе, и замыкание первого ему недоступно. Так же, как
+      //: соседняя кнопка дампа ходит через `window.__ht_detector.dump()`.
+      var label = window.__ht_detector.mark();
       btn.textContent = (label === 'ухожу')
           ? 'Отметка: вернулся' : 'Отметка: ухожу';
-      btn.title = 'отметок: ' + FOCUS_MARKS.length;
+      btn.title = 'отметок: ' + window.__ht_detector.marks();
     }
     btn.addEventListener('click', doMark);
     window.addEventListener('keydown', function (e) {
