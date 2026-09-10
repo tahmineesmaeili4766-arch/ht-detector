@@ -135,7 +135,7 @@
   //: за предмет. Версия библиотеки приезжает СЮДА ИЗ БИБЛИОТЕКИ, командой
   //: моста `lib=<версия>`, и лежит в дампе отдельным полем `lib_version`;
   //: `null` там значит «харнесс её не передал», а не «версия неизвестна».
-  var PAGE_BUILD = 'page-rc119';
+  var PAGE_BUILD = 'page-rc123';
   var LIB_VERSION = null;
   //: ⚠️⚠️⚠️ ЧТО РАЗЫГРАНО В СЕССИИ (rc118 §3). Устройство прокрутки
   //: и темперамент разыгрываются ОДИН РАЗ на сессию и меняют наблюдаемое
@@ -666,6 +666,505 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════
+  //  Часть D: СОГЛАСОВАННОСТЬ ЗНАЧЕНИЙ (rc123)
+  // ══════════════════════════════════════════════════════════════════════
+  //: ⚠️⚠️⚠️ СЛЕПОЕ ПЯТНО, РАДИ КОТОРОГО ЗАВЕДЁН БЛОК: весь раздел утечек
+  //: до сих пор сравнивал ИМЕНА (`getOwnPropertyNames`, символы, прототипы,
+  //: `toString`). Разность имён пуста — и это правда. Но классический след
+  //: автоматизации почти всегда НЕ новое имя, а НЕСОГЛАСОВАННОЕ ЗНАЧЕНИЕ
+  //: у имени, которое есть у всех: подключение по CDP включает эмуляции,
+  //: и ни одна из них не заводит имён — все они меняют ЧИСЛА И ФЛАГИ.
+  //: Новое имя видно перечислением; расхождение значений перечислением
+  //: не видно ВООБЩЕ, и прибор его не искал ни разу.
+  //:
+  //: ⚠️⚠️⚠️ ЭТАЛОН — ЖИВОЙ БРАУЗЕР ТОГО ЖЕ ПРОФИЛЯ, А НЕ «РАЗУМНЫЕ
+  //: ЗНАЧЕНИЯ». Мы дважды обожглись на эвристиках по форме (имя биндинга
+  //: искали по «строчные и цифры, 10-20 знаков» — 80 попаданий на
+  //: `onmousedown`; `deviceMemory` 32 объявили детекцией по СТАНДАРТУ,
+  //: а живой Chrome владельца даёт ровно 32). Поэтому `agree` вычисляется
+  //: ТОЛЬКО там, где отношение ОПРЕДЕЛИТЕЛЬНОЕ — то есть нарушимо лишь
+  //: подменой, а не настройкой машины. Везде, где «так обычно бывает»,
+  //: стоит `agree: null` и `by: 'эталон'`: вердикт выносит РАЗНОСТЬ ПЛЕЧ,
+  //: а не эта страница.
+  //:
+  //: ⚠️⚠️ ЕДИНИЦА НАБЛЮДЕНИЯ — ПАРА, А НЕ ЧИСЛО. Одиночное значение здесь
+  //: не значит ничего: `outerHeight` 800 нормален, `innerHeight` 800
+  //: нормален, а вместе они говорят, что хрома браузера нет вовсе. Поэтому
+  //: каждая запись несёт ОБЕ половины сырыми — читатель обязан видеть,
+  //: из чего посчитан вердикт, и уметь пересчитать его иначе.
+
+  //: ⚠️ Кап дорожки: пишем ТОЛЬКО переходы, поэтому 400 записей — это
+  //: 400 переключений окна, а их у человека десятки за сеанс.
+  var FOCUS_TRACK_CAP = 400;
+  var FOCUS_SAMPLE_MS = 250;
+  var FOCUS_TRACK = [], FOCUS_DROPPED = 0;
+  var FOCUS_EVENTS = {focus: 0, blur: 0, visibilitychange: 0,
+                      pageshow: 0, pagehide: 0};
+  var FOCUS_LAST = null;
+
+  function focusNow() {
+    var hf = null;
+    try { hf = document.hasFocus(); } catch (e) { hf = 'бросил'; }
+    return {hf: hf,
+            vis: document.visibilityState,
+            hidden: document.hidden === true};
+  }
+
+  //: ⚠️⚠️ ЗАПИСЫВАЕТСЯ ПЕРЕХОД, А НЕ ВЫБОРКА. Ровная линия из тысячи
+  //: одинаковых замеров не отвечает на вопрос вовсе, а переход отвечает
+  //: целиком: у живого браузера уход в фон меняет ОБЕ величины, у
+  //: эмулированного фокуса `hf` остаётся `true` при `vis: 'hidden'`.
+  function focusMark(why) {
+    var s = focusNow();
+    if (why === 'опрос' && FOCUS_LAST &&
+        FOCUS_LAST.hf === s.hf && FOCUS_LAST.vis === s.vis) {
+      return;
+    }
+    if (FOCUS_TRACK.length >= FOCUS_TRACK_CAP) { FOCUS_DROPPED += 1; return; }
+    FOCUS_TRACK.push({t: Math.round(ORIG.now()), why: why,
+                      hf: s.hf, vis: s.vis, hidden: s.hidden});
+    FOCUS_LAST = s;
+  }
+
+  //: ⚠️ Слушатели вешаются ЗДЕСЬ, а не в `DOMContentLoaded`: переход,
+  //: случившийся во время загрузки, иначе пропал бы, а именно на загрузке
+  //: сайт и снимает отпечаток. Скрипт первый в документе.
+  (function () {
+    var targets = [[window, 'focus'], [window, 'blur'],
+                   [document, 'visibilitychange'],
+                   [window, 'pageshow'], [window, 'pagehide']], i;
+    for (i = 0; i < targets.length; i++) {
+      (function (target, type) {
+        target.addEventListener(type, function (e) {
+          //: ⚠⚠ ФИЛЬТР ПО ЦЕЛИ НЕСУЩИЙ, а не аккуратность.
+          //: `focus`/`blur` НЕ всплывают, но в фазе CAPTURE слушатель
+          //: на `window` получает И СОБЫТИЯ ЭЛЕМЕНТОВ тоже. Без фильтра
+          //: счётчик `blur` растёт от каждого ухода фокуса с поля ввода,
+          //: и пара `blur_delivered` считала бы погашенный ОКОННЫЙ `blur`
+          //: доставленным — то есть маскировала бы ровно ту находку,
+          //: ради которой заведена (поймано на смоуке rc123: 2 лишних `blur`
+          //: от кликов по полям).
+          if ((type === 'focus' || type === 'blur') && e && e.target !== window) {
+            return;
+          }
+          FOCUS_EVENTS[type] = (FOCUS_EVENTS[type] || 0) + 1;
+          focusMark(type);
+        }, {capture: true, passive: true});
+      })(targets[i][0], targets[i][1]);
+    }
+    focusMark('база');
+    //: Часовой нужен затем же, зачем часовой над ключами: событие можно
+    //: не получить (эмуляция фокуса гасит именно `blur`), а состояние
+    //: при этом уже другое. Опрос ловит переход БЕЗ события — и это
+    //: сама по себе находка.
+    setInterval(function () { focusMark('опрос'); }, FOCUS_SAMPLE_MS);
+  })();
+
+  //: ⚠️⚠️ ОБЩАЯ ФОРМА ЗАПИСИ. `a`/`b` — сырые половины, `rel` — словами,
+  //: КАКОЕ отношение между ними обязано выполняться, `agree` — вердикт
+  //: ТОЛЬКО для определительных отношений, `by` — кто выносит вердикт.
+  function pair(rel, a, b, agree, note) {
+    return {rel: rel, a: a, b: b, agree: agree,
+            by: (agree === null) ? 'эталон' : 'определение',
+            note: note || null};
+  }
+
+  function mm(q) {
+    try {
+      var r = window.matchMedia(q);
+      return r ? r.matches : null;
+    } catch (e) { return null; }
+  }
+
+  var _MEDIA_QUERIES = [
+    'prefers-color-scheme: dark', 'prefers-color-scheme: light',
+    'prefers-reduced-motion: reduce', 'prefers-reduced-transparency: reduce',
+    'prefers-contrast: more', 'forced-colors: active',
+    'hover: hover', 'hover: none', 'any-hover: hover', 'any-hover: none',
+    'pointer: fine', 'pointer: coarse', 'pointer: none',
+    'any-pointer: fine', 'any-pointer: coarse',
+    'display-mode: browser', 'display-mode: fullscreen',
+    'color-gamut: srgb', 'update: fast', 'scripting: enabled',
+    'orientation: landscape'
+  ];
+
+  function mediaRow() {
+    var out = {}, i, q;
+    for (i = 0; i < _MEDIA_QUERIES.length; i++) {
+      q = _MEDIA_QUERIES[i];
+      out[q] = mm('(' + q + ')');
+    }
+    return out;
+  }
+
+  function geometryRow() {
+    var vv = window.visualViewport || null;
+    return {
+      inner: {w: window.innerWidth, h: window.innerHeight},
+      outer: {w: window.outerWidth, h: window.outerHeight},
+      screen: {w: screen.width, h: screen.height,
+               availW: screen.availWidth, availH: screen.availHeight,
+               availLeft: ('availLeft' in screen) ? screen.availLeft : null,
+               availTop: ('availTop' in screen) ? screen.availTop : null,
+               colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth,
+               orientation: (screen.orientation && screen.orientation.type)
+                   ? screen.orientation.type : null,
+               orientation_angle: (screen.orientation &&
+                   typeof screen.orientation.angle === 'number')
+                   ? screen.orientation.angle : null},
+      pos: {screenX: window.screenX, screenY: window.screenY,
+            screenLeft: window.screenLeft, screenTop: window.screenTop},
+      dpr: window.devicePixelRatio,
+      visual: vv ? {w: Math.round(vv.width), h: Math.round(vv.height),
+                    scale: vv.scale,
+                    offLeft: Math.round(vv.offsetLeft),
+                    offTop: Math.round(vv.offsetTop)} : null,
+      //: Высота хрома браузера. Само по себе число не значит ничего —
+      //: значит его РАВЕНСТВО нулю при непустом окне и его расхождение
+      //: между плечами.
+      chrome: {w: window.outerWidth - window.innerWidth,
+               h: window.outerHeight - window.innerHeight},
+      fullscreen: !!document.fullscreenElement
+    };
+  }
+
+  function deviceRow() {
+    var nav = window.navigator;
+    var uap = null;
+    try {
+      uap = nav.userAgentData
+          ? {platform: nav.userAgentData.platform,
+             mobile: nav.userAgentData.mobile === true} : null;
+    } catch (e) { uap = 'бросил'; }
+    return {
+      platform: nav.platform,
+      ua_platform: uap,
+      //: ⚠️ Из UA берётся ТОЛЬКО скобочная часть — та, по которой сайт
+      //: и опознаёт платформу. Полная строка уже лежит в блоке B.
+      ua_paren: (function () {
+        var m = /\(([^)]*)\)/.exec(nav.userAgent || '');
+        return m ? m[1] : null;
+      })(),
+      max_touch_points: nav.maxTouchPoints,
+      hardware_concurrency: nav.hardwareConcurrency,
+      device_memory: ('deviceMemory' in nav) ? nav.deviceMemory : null,
+      vendor: nav.vendor,
+      language: nav.language,
+      languages: nav.languages
+          ? Array.prototype.slice.call(nav.languages) : null,
+      pdf_viewer_enabled: ('pdfViewerEnabled' in nav)
+          ? nav.pdfViewerEnabled : null,
+      webdriver: ('webdriver' in nav) ? nav.webdriver : 'нет свойства'
+    };
+  }
+
+  //: ⚠️ Асинхронное спрашивается ЗАРАНЕЕ и кладётся в переменную: канал
+  //: моста синхронный. Тот же приём, что у `_permState` блока B.
+  var _PERMS = {};
+  var _PERM_NAMES = ['notifications', 'geolocation', 'camera', 'microphone',
+                     'midi', 'clipboard-read', 'background-sync',
+                     'persistent-storage'];
+  (function () {
+    var i;
+    for (i = 0; i < _PERM_NAMES.length; i++) {
+      (function (nm) {
+        _PERMS[nm] = 'не отвечал';
+        try {
+          if (!navigator.permissions || !navigator.permissions.query) {
+            _PERMS[nm] = 'нет API';
+            return;
+          }
+          navigator.permissions.query({name: nm}).then(
+              function (r) { _PERMS[nm] = r.state; },
+              function (e) { _PERMS[nm] = 'ошибка: ' + String(e && e.name); });
+        } catch (e) { _PERMS[nm] = 'бросил: ' + String(e && e.name); }
+      })(_PERM_NAMES[i]);
+    }
+  })();
+
+  //: ⚠️ Имя ресурса режется до последнего сегмента пути БЕЗ query:
+  //: в дампе не должно быть ни адресов, ни параметров — то же правило,
+  //: что у `key_seq` про введённый текст.
+  function lastSeg(u) {
+    try {
+      var s = String(u).split('?')[0].split('#')[0];
+      var parts = s.split('/');
+      return parts[parts.length - 1] || s.slice(0, 40);
+    } catch (e) { return null; }
+  }
+
+  var RES_CAP = 40;
+
+  function resourceRow() {
+    var out = {supported: false, n: 0, protocols: {}, nav: null, entries: [],
+               note: 'страница внешних запросов не делает: пустой список — ' +
+                     'ожидаемое состояние, а вот ПРОТОКОЛ навигации значим'};
+    try {
+      if (!window.performance || !performance.getEntriesByType) { return out; }
+      out.supported = true;
+      var navs = performance.getEntriesByType('navigation');
+      if (navs && navs.length) {
+        out.nav = {type: navs[0].type,
+                   proto: navs[0].nextHopProtocol,
+                   transfer: navs[0].transferSize,
+                   encoded: navs[0].encodedBodySize,
+                   decoded: navs[0].decodedBodySize};
+      }
+      var rs = performance.getEntriesByType('resource'), i, e, p;
+      out.n = rs.length;
+      for (i = 0; i < rs.length && i < RES_CAP; i++) {
+        e = rs[i];
+        p = (e.nextHopProtocol === '' || e.nextHopProtocol === undefined)
+            ? '(пусто)' : e.nextHopProtocol;
+        out.protocols[p] = (out.protocols[p] || 0) + 1;
+        out.entries.push({name: lastSeg(e.name), init: e.initiatorType,
+                          proto: p, transfer: e.transferSize,
+                          encoded: e.encodedBodySize,
+                          decoded: e.decodedBodySize});
+      }
+    } catch (err) { out.error = String((err && err.message) || err); }
+    return out;
+  }
+
+  //: Смещение, которое СЛЕДУЕТ из объявленной зоны, — считается, а не
+  //: угадывается: зона форматирует ту же метку времени, и разность
+  //: с UTC даёт минуты.
+  function offsetFromZone(zone, d) {
+    try {
+      var dtf = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone, hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'});
+      var parts = dtf.formatToParts(d), map = {}, i;
+      for (i = 0; i < parts.length; i++) { map[parts[i].type] = parts[i].value; }
+      var h = parseInt(map.hour, 10);
+      if (h === 24) { h = 0; }
+      var asUTC = Date.UTC(parseInt(map.year, 10), parseInt(map.month, 10) - 1,
+                           parseInt(map.day, 10), h,
+                           parseInt(map.minute, 10), parseInt(map.second, 10));
+      return -Math.round((asUTC - d.getTime()) / 60000);
+    } catch (e) { return null; }
+  }
+
+  function focusRow() {
+    var tr = FOCUS_TRACK, i, k;
+    var states = {}, distinct = 0;
+    for (i = 0; i < tr.length; i++) { states[tr[i].hf + '/' + tr[i].vis] = true; }
+    for (k in states) { distinct += 1; }
+    //: Переход = соседние записи с РАЗНЫМ состоянием. Считается по
+    //: дорожке, а не по счётчикам событий: событие может не прийти,
+    //: и именно это нам и интересно.
+    var transitions = 0;
+    for (i = 1; i < tr.length; i++) {
+      if (tr[i].hf !== tr[i - 1].hf || tr[i].vis !== tr[i - 1].vis) {
+        transitions += 1;
+      }
+    }
+    return {now: focusNow(), track: tr, dropped: FOCUS_DROPPED,
+            events: FOCUS_EVENTS, sample_ms: FOCUS_SAMPLE_MS,
+            distinct_states: distinct, transitions: transitions,
+            //: ⚠️⚠️ ПРАВИЛО rc71 §3, БЕЗ КОТОРОГО БЛОК НЕ УТВЕРЖДАЕТ
+            //: НИЧЕГО: в активном окне `hasFocus` истинен У ВСЕХ. Плечо,
+            //: где владелец не переключался на другое окно, обязано
+            //: СКАЗАТЬ это вслух, а не показывать ровную линию.
+            verdict: transitions
+                ? ('переходы есть: ' + transitions)
+                : 'НЕ ПРОВЕРЕНО: переходов не было — на это плечо ' +
+                  'вопрос про эмуляцию фокуса не отвечает'};
+  }
+
+  function dumpD() {
+    var g = geometryRow(), dev = deviceRow(), med = mediaRow();
+    var f = focusRow();
+    var d = new Date();
+    var zone = null;
+    try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone; }
+    catch (e) { zone = null; }
+    var zoneOff = offsetFromZone(zone, d);
+    var realOff = d.getTimezoneOffset();
+    var notifPerm = (typeof Notification !== 'undefined')
+        ? Notification.permission : null;
+    var permNotif = _PERMS.notifications;
+    var _PERM_MAP = {granted: 'granted', denied: 'denied', prompt: 'default'};
+    var pairs = {}, i;
+
+    // ── (а) фокус: единственная ОПРЕДЕЛИТЕЛЬНАЯ пара блока ─────────────
+    //: ⚠️⚠️ У ЖИВОГО БРАУЗЕРА СКРЫТАЯ ВКЛАДКА НЕ ДЕРЖИТ ФОКУС. Пара
+    //: `vis: 'hidden'` + `hasFocus(): true` невозможна без эмуляции —
+    //: это не «редко», а противоречие внутри одного документа.
+    var contradiction = null, hiddenSeen = false;
+    for (i = 0; i < f.track.length; i++) {
+      if (f.track[i].vis === 'hidden') {
+        hiddenSeen = true;
+        if (f.track[i].hf === true && !contradiction) {
+          contradiction = f.track[i];
+        }
+      }
+    }
+    pairs.hidden_but_focused = pair(
+        'visibilityState === "hidden" ⇒ hasFocus() === false',
+        {vis_hidden_seen: hiddenSeen},
+        {contradiction: contradiction},
+        hiddenSeen ? !contradiction : null,
+        hiddenSeen ? null
+            : 'документ ни разу не был скрыт — пара НЕ ПРОВЕРЕНА');
+    pairs.hidden_matches_visibility = pair(
+        'document.hidden === (visibilityState === "hidden")',
+        {hidden: f.now.hidden}, {vis: f.now.vis},
+        f.now.hidden === (f.now.vis === 'hidden'), null);
+    //: ⚠️ Уход фокуса ОБЯЗАН сопровождаться событием `blur`. Дорожка
+    //: видит переход опросом; если переход есть, а события нет — событие
+    //: погашено, и это отдельная находка.
+    var lostFocus = false;
+    for (i = 1; i < f.track.length; i++) {
+      if (f.track[i - 1].hf === true && f.track[i].hf === false) {
+        lostFocus = true;
+      }
+    }
+    pairs.blur_delivered = pair(
+        'переход hasFocus true→false ⇒ хотя бы одно событие blur',
+        {lost_focus_seen: lostFocus}, {blur_events: f.events.blur},
+        lostFocus ? (f.events.blur > 0) : null,
+        lostFocus ? null : 'потери фокуса не наблюдалось — НЕ ПРОВЕРЕНО');
+
+    // ── (б) геометрия окна ─────────────────────────────────────────────
+    pairs.outer_ge_inner = pair(
+        'outerWidth ≥ innerWidth и outerHeight ≥ innerHeight',
+        g.outer, g.inner,
+        (g.outer.w >= g.inner.w && g.outer.h >= g.inner.h), null);
+    pairs.avail_le_screen = pair(
+        'availWidth ≤ width и availHeight ≤ height',
+        {availW: g.screen.availW, availH: g.screen.availH},
+        {w: g.screen.w, h: g.screen.h},
+        (g.screen.availW <= g.screen.w && g.screen.availH <= g.screen.h),
+        null);
+    pairs.chrome_height = pair(
+        'outerHeight − innerHeight = высота хрома браузера',
+        {chrome_h: g.chrome.h, chrome_w: g.chrome.w},
+        {outer: g.outer, inner: g.inner},
+        null,
+        'ноль значит «окна браузера нет» (headless/kiosk); величина ' +
+        'сверяется С ЭТАЛОНОМ того же профиля, а не с «обычной»');
+    pairs.visual_vs_inner = pair(
+        'visualViewport.width ≈ innerWidth (разница = полоса прокрутки)',
+        g.visual, g.inner,
+        null, 'вердикт по эталону: у разных профилей разная полоса');
+    pairs.inner_vs_screen = pair(
+        'innerWidth ≤ screen.width (окно не шире экрана)',
+        g.inner, {w: g.screen.w, h: g.screen.h},
+        null, 'не определительное: возможны второй монитор и зум');
+    pairs.orientation_vs_aspect = pair(
+        'screen.orientation: landscape ⇔ width ≥ height',
+        {orientation: g.screen.orientation, angle: g.screen.orientation_angle},
+        {w: g.screen.w, h: g.screen.h,
+         media_landscape: med['orientation: landscape']},
+        (g.screen.orientation === null) ? null
+            : ((String(g.screen.orientation).indexOf('landscape') === 0) ===
+               (g.screen.w >= g.screen.h)),
+        null);
+
+    // ── (в) медиа-признаки ─────────────────────────────────────────────
+    pairs.color_scheme_exclusive = pair(
+        'prefers-color-scheme: dark и light не могут совпасть',
+        {dark: med['prefers-color-scheme: dark']},
+        {light: med['prefers-color-scheme: light']},
+        !(med['prefers-color-scheme: dark'] &&
+          med['prefers-color-scheme: light']), null);
+    pairs.pointer_vs_touch = pair(
+        'any-pointer: coarse ⇔ maxTouchPoints > 0',
+        {coarse: med['any-pointer: coarse'], fine: med['any-pointer: fine'],
+         hover: med['hover: hover']},
+        {max_touch_points: dev.max_touch_points},
+        null,
+        'не определительное (стилус, ТВ-пульт) — вердикт по эталону, ' +
+        'но расхождение половин это классический признак');
+    pairs.hover_vs_pointer = pair(
+        'hover: none обычно идёт с pointer: coarse',
+        {hover_none: med['hover: none'], hover_hover: med['hover: hover']},
+        {pointer_fine: med['pointer: fine'],
+         pointer_coarse: med['pointer: coarse']},
+        null, 'вердикт по эталону');
+
+    // ── (г) устройство и UA ────────────────────────────────────────────
+    //: ⚠️ Соответствие «Windows ↔ Win32» — не спека, а соглашение
+    //: платформы; поэтому ожидание ПЕЧАТАЕТСЯ, но вердикт не выносится:
+    //: таблица составлена НАМИ, а это ровно та эвристика по форме,
+    //: на которой мы уже обжигались.
+    var _PLAT = {Windows: 'Win32', macOS: 'MacIntel',
+                 Linux: 'Linux x86_64', Android: 'Linux armv8l',
+                 'Chrome OS': 'Linux x86_64'};
+    var uapPlat = (dev.ua_platform && dev.ua_platform.platform) || null;
+    pairs.platform_vs_ua_data = pair(
+        'navigator.platform соответствует userAgentData.platform',
+        {platform: dev.platform},
+        {ua_data_platform: uapPlat, ua_paren: dev.ua_paren},
+        null,
+        'таблица соответствий составлена НАМИ; ожидание для ' +
+        String(uapPlat) + ' — ' + String(_PLAT[uapPlat]) +
+        '; вердикт выносит эталон');
+    pairs.mobile_vs_touch = pair(
+        'userAgentData.mobile ⇔ maxTouchPoints > 0',
+        {mobile: dev.ua_platform && dev.ua_platform.mobile},
+        {max_touch_points: dev.max_touch_points},
+        null, 'вердикт по эталону');
+    pairs.language_head = pair(
+        'navigator.languages[0] === navigator.language',
+        {language: dev.language},
+        {languages_0: dev.languages ? dev.languages[0] : null},
+        (dev.languages && dev.languages.length)
+            ? (dev.languages[0] === dev.language) : null,
+        null);
+
+    // ── (д) разрешения ─────────────────────────────────────────────────
+    pairs.notifications_pair = pair(
+        'permissions.query(notifications).state ↔ Notification.permission ' +
+        '(granted↔granted, denied↔denied, prompt↔default)',
+        {permissions_state: permNotif},
+        {notification_permission: notifPerm},
+        (_PERM_MAP[permNotif] === undefined || notifPerm === null)
+            ? null : (_PERM_MAP[permNotif] === notifPerm),
+        (_PERM_MAP[permNotif] === undefined)
+            ? 'состояние не из тройки granted/denied/prompt — сравнивать нечего'
+            : null);
+
+    // ── (е) часовой пояс: считается, а не угадывается ──────────────────
+    pairs.timezone_offset = pair(
+        'смещение, следующее из IANA-зоны, = getTimezoneOffset()',
+        {zone: zone, implied_offset_min: zoneOff},
+        {get_timezone_offset_min: realOff},
+        (zoneOff === null) ? null : (zoneOff === realOff), null);
+
+    // ── сводка: сколько пар вообще ВЫНЕСЛИ вердикт ─────────────────────
+    var total = 0, decided = 0, failed = [], nm;
+    for (nm in pairs) {
+      total += 1;
+      if (pairs[nm].agree === true) { decided += 1; }
+      else if (pairs[nm].agree === false) { decided += 1; failed.push(nm); }
+    }
+    return {
+      focus: f,
+      media: med,
+      geometry: g,
+      device: dev,
+      permissions: _PERMS,
+      resources: resourceRow(),
+      timezone: {zone: zone, implied_offset_min: zoneOff,
+                 get_timezone_offset_min: realOff},
+      pairs: pairs,
+      summary: {pairs_total: total,
+                pairs_decided: decided,
+                pairs_disagree: failed,
+                //: ⚠️⚠️ Ноль решённых пар — это «прибор не сработал»,
+                //: а не «всё согласовано». Разбор обязан различать.
+                verdict: decided
+                    ? (failed.length
+                        ? ('РАСХОЖДЕНИЯ ЕСТЬ: ' + failed.join(', '))
+                        : 'определительные пары сходятся')
+                    : 'НЕ ПРОВЕРЕНО: ни одна пара не вынесла вердикта'}
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
   //  Часть C: подпись событий (компактная запись; полные таблицы — на стенде)
   // ══════════════════════════════════════════════════════════════════════
 
@@ -676,10 +1175,48 @@
   var KEY_TYPES = ['keydown', 'keypress', 'keyup'];
   var OTHER_TYPES = ['wheel', 'input', 'change', 'focus', 'blur', 'scroll'];
 
-  function tgtId(e) {
+  //: ⚠️⚠️ ДВА КЛЮЧА, И ЭТО НЕ ДУБЛИРОВАНИЕ (rc121 §1). `id` — ЛИЧНОСТЬ
+  //: цели, `pk` — КЛЮЧ ПАРЫ down/up. Прежний `id || tagName` был обоими
+  //: сразу, и по нему ТРИ опции кастомного списка, текст баннера и два
+  //: оформительских span писались ОДИНАКОВО: недоверенная пачка rc120 легла
+  //: на «span», а какой это span — из дампа установить было НЕЧЕМ. Прибор
+  //: не различал ровно того, что у него спрашивали.
+  //: ⚠️⚠️ Пары считаются ПРЕЖНИМ ключом НАМЕРЕННО: удержание (`press_seq`,
+  //: `mouse_holds_ms`) — измеренная величина с опубликованными числами,
+  //: и смена ключа пары сдвинула бы её МОЛЧА.
+  function safeAttr(v) {
+    return String(v).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16);
+  }
+
+  function tgtKey(e) {
     var t = e.target;
     if (!t) { return null; }
     return t.id || (t.tagName ? t.tagName.toLowerCase() : null);
+  }
+
+  function tgtId(e) {
+    var t = e.target;
+    if (!t) { return null; }
+    if (t.id) { return t.id; }
+    if (!t.tagName) { return null; }
+    var s = t.tagName.toLowerCase(), i, v = null, a;
+    var role = t.getAttribute ? t.getAttribute('role') : null;
+    if (role) { s += '[' + safeAttr(role) + ']'; }
+    //: ⚠️ Значение берётся ТОЛЬКО из data-атрибутов и ТОЧНЫМИ именами.
+    //: `value` у поля ввода — это то, что набрал человек, а введённого
+    //: текста в дампе быть не должно (то же правило, что у `key_seq`).
+    //: `data-v` — точным именем, НЕ префиксом: `data-v-7ba5bd90` это
+    //: маркер scoped-стилей Vue и к значению опции отношения не имеет.
+    var names = ['data-value', 'data-v', 'data-option-value'];
+    for (i = 0; i < names.length; i++) {
+      a = t.getAttribute ? t.getAttribute(names[i]) : null;
+      if (a) { v = a; break; }
+    }
+    if (v) { s += '=' + safeAttr(v); }
+    if (t.parentNode && t.parentNode.children) {
+      s += '#' + Array.prototype.indexOf.call(t.parentNode.children, t);
+    }
+    return s;
   }
 
   function on(e) {
@@ -707,6 +1244,14 @@
       type: e.type,
       trusted: e.isTrusted === true,
       id: tgtId(e),
+      pk: tgtKey(e),
+      //: ⚠️⚠️ rc121 §2: ещё два КАТЕГОРИАЛЬНЫХ признака, и оба про синтетику.
+      //: У настоящего `click` `detail` ≥ 1, у нашего уровня 4 — 0 (в
+      //: конструктор не передаётся). Настоящий `mouseenter` НЕ ВСПЛЫВАЕТ
+      //: никогда, а мы шлём его с `bubbles: true`. Порогов тут нет: оба
+      //: значения невозможны у живого указателя, а не «редки».
+      det: (typeof e.detail === 'number') ? e.detail : null,
+      bub: e.bubbles === true,
       x: (typeof e.clientX === 'number') ? Math.round(e.clientX) : null,
       y: (typeof e.clientY === 'number') ? Math.round(e.clientY) : null,
       sx: (typeof e.screenX === 'number') ? Math.round(e.screenX) : null,
@@ -810,8 +1355,14 @@
       if (r.trusted) {
         out.trusted_by_type[r.type] = (out.trusted_by_type[r.type] || 0) + 1;
       } else if (out.untrusted_examples.length < 40) {
-        out.untrusted_examples.push({type: r.type, id: r.id, t: r.t,
-                                     x: r.x, y: r.y, key: r.key});
+        //: ⚠️⚠️ rc121 §2: строка недоверенного события несёт ВСЕ признаки,
+        //: по которым его опознают, — иначе читатель идёт за ними в `raw()`,
+        //: а в боевом разборе туда не ходят. `sx`/`btn` тут были и раньше,
+        //: просто не в этой строке: разбор rc120 их не увидел.
+        out.untrusted_examples.push({type: r.type, id: r.id, t: r.t, ts: r.ts,
+                                     x: r.x, y: r.y, sx: r.sx, btn: r.btn,
+                                     det: r.det, bub: r.bub, pid: r.pid,
+                                     key: r.key});
       }
 
       if (r.type === 'mousemove' && !sawFirstPress) { movesBeforeFirstPress++; }
@@ -824,29 +1375,29 @@
 
       if (r.type === 'mousedown') {
         sawFirstPress = true;
-        downT[r.id || '_'] = r.ts !== null ? r.ts : r.t;
+        downT[r.pk || '_'] = r.ts !== null ? r.ts : r.t;
         //: Запись заводится на DOWN и дополняется на UP: нажатие без
         //: отпускания обязано остаться видимым (`t_up === null`).
         if (out.press_seq.length < PRESS_SEQ_CAP) {
           out.press_seq.push([r.ts !== null ? r.ts : r.t, null, r.x, r.y,
                               r.btn]);
-          pressOpen[r.id || '_'] = out.press_seq.length - 1;
+          pressOpen[r.pk || '_'] = out.press_seq.length - 1;
         } else { out.press_seq_dropped++; }
       }
       if (r.type === 'mouseup') {
-        var d0 = downT[r.id || '_'];
+        var d0 = downT[r.pk || '_'];
         if (d0 !== undefined) {
           out.mouse_holds_ms.push(Math.round(((r.ts !== null ? r.ts : r.t) - d0) * 10) / 10);
-          delete downT[r.id || '_'];
+          delete downT[r.pk || '_'];
         }
-        var pi = pressOpen[r.id || '_'];
+        var pi = pressOpen[r.pk || '_'];
         if (pi !== undefined && out.press_seq[pi]) {
           out.press_seq[pi][1] = r.ts !== null ? r.ts : r.t;
           //: Координаты ОТПУСКАНИЯ дописываются отдельными полями, чтобы
           //: смещение за время нажатия считалось без второй записи.
           out.press_seq[pi][5] = r.x;
           out.press_seq[pi][6] = r.y;
-          delete pressOpen[r.id || '_'];
+          delete pressOpen[r.pk || '_'];
         }
       }
       if (r.type === 'pointerdown' && r.pres === 0 && r.btn === 1) {
@@ -1119,10 +1670,11 @@
                    banner_open: !!document.getElementById('cookie-banner') &&
                        document.getElementById('cookie-banner').style.display !== 'none',
                    cart: (document.getElementById('cart-count') || {}).textContent},
-            A: dumpA(), B: dumpB(), C: stats()};
+            A: dumpA(), B: dumpB(), C: stats(), D: dumpD()};
   }
 
   window.__ht_detector = {dump: dumpAll, dumpA: dumpA, dumpB: dumpB,
+                          dumpD: dumpD,
                           stats: stats, selftest: selftest, rearm: rearm,
                           note: noteDump,
                           //: ⚠️ Тот же источник, что у блока `channels`
